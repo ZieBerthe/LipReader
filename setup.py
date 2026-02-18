@@ -13,6 +13,8 @@ setup(
         "numpy>=1.24.0",
         "torch>=2.0.0",
         "torchvision>=0.15.0",
+        # MediaPipe: Works with 0.10+ but uses fallback OpenCV detection
+        # For best results with face landmarks, use MediaPipe < 0.10
         "mediapipe>=0.10.0",
         "scipy>=1.10.0",
         "pillow>=10.0.0",

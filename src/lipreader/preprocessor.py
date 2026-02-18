@@ -111,15 +111,9 @@ class VideoPreprocessor:
             face_landmarks = results.multi_face_landmarks[0]
             h, w = frame.shape[:2]
             
-            # Lip landmark indices (MediaPipe Face Mesh)
-            lip_indices = [
-                61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 185,  # Outer
-                78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 191     # Inner
-            ]
-            
-            # Get lip landmarks
+            # Get lip landmarks using instance variable
             lip_points = []
-            for idx in lip_indices:
+            for idx in self.lip_indices:
                 landmark = face_landmarks.landmark[idx]
                 x = int(landmark.x * w)
                 y = int(landmark.y * h)

@@ -45,6 +45,6 @@ class Config:
         """Convert config to dictionary."""
         return {
             key: value
-            for key, value in self.__class__.__dict__.items()
+            for key, value in vars(self).items()
             if not key.startswith("_") and not callable(value)
         }

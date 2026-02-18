@@ -3,6 +3,8 @@ opencv-python>=4.8.0
 numpy>=1.24.0
 torch>=2.0.0
 torchvision>=0.15.0
+# MediaPipe: for best results use version < 0.10 which has the solutions API
+# Version 0.10+ uses tasks API which requires different implementation
 mediapipe>=0.10.0
 scipy>=1.10.0
 pillow>=10.0.0
