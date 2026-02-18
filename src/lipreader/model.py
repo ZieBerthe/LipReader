@@ -24,14 +24,14 @@ class LipReadingModel:
         self.config = config or Config()
         self.device = torch.device(self.config.DEVICE)
         
+        # Simple vocabulary (can be extended) - must be created before model
+        self.vocabulary = self._build_vocabulary()
+        self.idx_to_word = {idx: word for word, idx in self.vocabulary.items()}
+        
         # Build the model
         self.model = self._build_model()
         self.model.to(self.device)
         self.model.eval()
-        
-        # Simple vocabulary (can be extended)
-        self.vocabulary = self._build_vocabulary()
-        self.idx_to_word = {idx: word for word, idx in self.vocabulary.items()}
     
     def _build_vocabulary(self) -> dict:
         """
