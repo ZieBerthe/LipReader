@@ -1,0 +1,13 @@
+# Core dependencies for lip reading pipeline
+opencv-python>=4.8.0
+numpy>=1.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+mediapipe>=0.10.0
+scipy>=1.10.0
+pillow>=10.0.0
+tqdm>=4.65.0
+
+# Optional dependencies for advanced features
+# pytorchvideo>=0.1.5
+# transformers>=4.30.0
