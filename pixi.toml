@@ -1,0 +1,21 @@
+[workspace]
+authors = ["BERTHÉ Zié  <zie.berthe@polytechnique.edu>"]
+channels = ["conda-forge"]
+name = "LipReader"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "==3.10"
+opencv = ">=4.7.0,<5"
+numpy = ">=1.26.4,<2"
+typing = ">=3.10.0.0,<4"
+pytorch = ">=2.10.0,<3"
+matplotlib = ">=3.10.8,<4"
+imageio = ">=2.37.0,<3"
+gdown = ">=5.2.1,<6"
+
+[pypi-dependencies]
+mediapipe = ">=0.10.32, <0.11"

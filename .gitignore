@@ -1,0 +1,7 @@
+#all the data, you can just use download_data to download them
+data/
+*.zip
+*.align
+*.mpg# pixi environments
+.pixi/*
+!.pixi/config.toml
