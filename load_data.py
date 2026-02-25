@@ -9,6 +9,8 @@ import gdown
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+import librosa
+import soundfile as sf
 torch.device('cuda' if torch.cuda.is_available() else 'cpu') 
 # MediaPipe for face mesh and landmark detection
 model_path = "models/face_landmarker.task"  # path to downloaded model
@@ -25,6 +27,17 @@ options = FaceLandmarkerOptions(
 )
 
 landmarker = FaceLandmarker.create_from_options(options)
+#for the vocabulary, and loss calculation purpose
+vocab = [x for x in "abcdefghijklmnopqrstuvwxyz'?!1234567890 "]
+char_to_num = {char: idx for idx, char in enumerate((vocab))}
+num_to_char = {idx: char for char, idx in char_to_num.items()}
+def encode_chars(chars):
+    """Convert list of characters to indices"""
+    return [char_to_num[c] for c in chars]
+
+def decode_indices(indices):
+    """Convert list of indices back to characters"""
+    return ''.join([num_to_char[i] for i in indices])
 
 def _crop_mouth(gray_frame: np.ndarray, landmarks: list, padding_ratio: float) -> np.ndarray:
     """Crop mouth region from MediaPipe FaceLandmarker (478-point model).
@@ -139,15 +152,216 @@ def load_video(video_path: str, padding_ratio: float = 0.8, target_size: Tuple[i
         raise ValueError(f"No valid mouth frames extracted from {video_path}")
     
     print(f"Video FPS: {fps:.2f}, Total frames extracted: {len(frames)}")
-    return frames
-if __name__ == "__main__":
-    video_path = "data/s1/bbaf2n.mpg"  # Update with your video path
+
+    # Normalize with torch to keep everything on the same side of the fence.
+    frames_tensor = torch.tensor(frames, dtype=torch.float32)
+    mean = frames_tensor.mean()
+    std = frames_tensor.std()
+    return (frames_tensor - mean) / std if std > 0 else frames_tensor
+
+
+#for the vocabulary, and allignement of the data with the text
+def load_alignment(alignment_path: str) -> List[int]:
+    """Load alignment file and return encoded character indices."""
+    with open(alignment_path, 'r') as f:
+        lines = f.readlines()
+    
+    tokens = ''
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 3 and parts[2] != 'sil':
+            tokens += ' ' + parts[2]
+    
+    # Convert string to list of characters, then encode
+    return encode_chars(list(tokens))
+
+def load_audio(
+    video_path: str,
+    sr: int = 16000,
+    n_mels: int = 128,
+    hop_length: int | None = None,
+    win_length: int | None = None,
+) -> Tuple[np.ndarray, np.ndarray, int, int, float, float, int, int]:
+    """Load audio from video file and extract log-mel features.
+    
+    Args:
+        video_path: Path to video file
+        sr: Sample rate for audio processing
+        n_mels: Number of mel bins
+        hop_length: Hop length in samples (auto-aligned to video FPS if None)
+        win_length: Window length in samples (defaults to 2 * hop_length if None)
+
+    Returns:
+        Tuple of (log_mel_features, waveform, sample_rate, hop_length,
+        log_mel_mean, log_mel_std, n_fft, win_length)
+    """
+    # Use fixed hop/win for better audio quality
+    # Alignment to video frames can be done via interpolation if needed
+    if hop_length is None:
+        hop_length = 160  # 10ms at 16kHz - good for quality
+    if win_length is None:
+        win_length = 400  # 25ms at 16kHz
+
+    try:
+        # Load audio from video
+        y, sr_loaded = librosa.load(video_path, sr=sr)
+    except Exception as exc:
+        raise ValueError(f"Could not load audio from {video_path}. Ensure ffmpeg is installed.")
+
+    if y.size == 0:
+        raise ValueError(f"No audio samples found in {video_path}.")
+
+    # Extract log-mel features (better target for reconstruction than MFCCs)
+    mel = librosa.feature.melspectrogram(
+        y=y,
+        sr=sr_loaded,
+        n_mels=n_mels,
+        hop_length=hop_length,
+        win_length=win_length,
+        power=2.0,
+    )
+    log_mel = np.log(np.maximum(mel, 1e-10)).T
+
+    # Normalize
+    mel_tensor = torch.tensor(log_mel, dtype=torch.float32)
+    mean = mel_tensor.mean().item()
+    std = mel_tensor.std().item()
+    mel_normalized = (mel_tensor - mean) / std if std > 0 else mel_tensor
+
+    n_fft = max(1024, win_length)
+
+    return mel_normalized, y, sr_loaded, hop_length, mean, std, n_fft, win_length
+
+def save_audio_from_video(video_path: str, output_wav_path: str, sr: int = 16000) -> None:
+    """Extract audio from a video and save as WAV.
+
+    This preserves the original waveform (resampled to sr) instead of reconstructing from MFCCs.
+    """
+    _, y, sr_loaded, _, _, _, _, _ = load_audio(video_path, sr=sr)
+    sf.write(output_wav_path, y, sr_loaded)
+
+def reconstruct_audio_from_log_mel(
+    log_mel_normalized: np.ndarray | torch.Tensor,
+    log_mel_mean: float,
+    log_mel_std: float,
+    sr: int,
+    hop_length: int,
+    win_length: int,
+    n_fft: int,
+    n_iter: int = 192,
+) -> np.ndarray:
+    """Reconstruct audio from normalized log-mel features using Griffin-Lim."""
+    if isinstance(log_mel_normalized, torch.Tensor):
+        log_mel_normalized = log_mel_normalized.cpu().numpy()
+
+    log_mel = (log_mel_normalized * log_mel_std) + log_mel_mean
+    mel = np.exp(log_mel).T
+    y = librosa.feature.inverse.mel_to_audio(
+        mel,
+        sr=sr,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        n_iter=n_iter,
+        power=2.0,
+    )
+    return y
+
+def align_audio_to_video(
+    audio_mel: torch.Tensor,
+    num_video_frames: int,
+) -> torch.Tensor:
+    """Align audio mel frames to video frames via interpolation.
+    
+    Args:
+        audio_mel: Audio features of shape (audio_frames, n_mels)
+        num_video_frames: Number of video frames to align to
+        
+    Returns:
+        Aligned audio features of shape (num_video_frames, n_mels)
+    """
+    # (T, M) -> (1, M, T) for interpolate
+    mel = audio_mel.T.unsqueeze(0)
+    aligned = torch.nn.functional.interpolate(
+        mel, size=num_video_frames, mode='linear', align_corners=False
+    )
+    return aligned.squeeze(0).T  # back to (num_video_frames, n_mels)
+# def load_alignment(alignment_path: str) -> List[Tuple[float, float, str]]:
+#     """Load alignment file and return list of (start_time, end_time, word) tuples."""
+#     with open(alignment_path, 'r') as f:
+#         lines = f.readlines()
+#     tokens = []
+#     for line in lines:
+#         parts = line.split()
+#         if len(parts) >= 3 and parts[2] != 'sil':
+#             tokens = [*tokens,' ', parts[2]]
+#     return encode_chars(torch.reshaped(torch.strings.unicode_split(tokens,input_encoding='UTF-8'),(-1,)).tolist())
+def load_data(
+    video_path: str,
+    alignment_path: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int, float, float, int, int, List[int]]:
+    """Load video, audio and alignment data.
+    
+    Args:
+        video_path: Path to video file
+        alignment_path: Path to alignment file
+        
+    Returns:
+        Tuple of (mouth_frames, audio_log_mel, audio_waveform, audio_sr, hop_length,
+        log_mel_mean, log_mel_std, n_fft, win_length, char_indices)
+    """
     mouth_frames = load_video(video_path)
-    print(f"Loaded {len(mouth_frames)} mouth frames from the video.")
-    # Display the first mouth frame as an example
-    for i in range(0,len(mouth_frames),5):
-        if mouth_frames:
-            plt.imshow(mouth_frames[i], cmap='gray')
-            plt.title("Example Mouth Frame")
-            plt.axis('off')
-            plt.show()
+    audio_log_mel, audio_waveform, audio_sr, hop_length, log_mel_mean, log_mel_std, n_fft, win_length = load_audio(video_path)
+    char_indices = load_alignment(alignment_path)
+    return (
+        mouth_frames,
+        audio_log_mel,
+        audio_waveform,
+        audio_sr,
+        hop_length,
+        log_mel_mean,
+        log_mel_std,
+        n_fft,
+        win_length,
+        char_indices,
+    )
+if __name__ == "__main__":
+    print("Vocabulary size:", len(vocab))
+    preprocessed = load_data(
+        video_path='data/s1/bbaf3s.mpg', 
+        alignment_path='data/alignments/s1/bbaf3s.align'
+    )
+    
+    (
+        mouth_frames,
+        audio_log_mel,
+        audio_waveform,
+        audio_sr,
+        hop_length,
+        log_mel_mean,
+        log_mel_std,
+        n_fft,
+        win_length,
+        char_indices,
+    ) = preprocessed
+    print(f'Mouth frames shape: {mouth_frames.shape}')
+    print(f'Audio log-mel shape: {audio_log_mel.shape}')
+    print(f'Character indices length: {len(char_indices)}')
+    print(f'Character sequence: {decode_indices(char_indices)}')
+    # Save extracted audio for verification
+    # save_audio_from_video('data/s1/bbaf3s.mpg', 'extracted_audio.wav', sr=audio_sr)
+    # check loaded audio
+    print(f'Extracted audio waveform shape: {audio_waveform.shape}, Sample rate: {audio_sr}')
+    # reconstruct audio from log-mel features to verify correctness
+    y_reconstructed = reconstruct_audio_from_log_mel(
+        audio_log_mel,
+        log_mel_mean,
+        log_mel_std,
+        sr=audio_sr,
+        hop_length=hop_length,
+        win_length=win_length,
+        n_fft=n_fft,
+        n_iter=128,
+    )
+    sf.write('reconstructed_audiobbaf3s.wav', y_reconstructed, audio_sr)
+    print("Saved reconstructed audio to reconstructed_audio.wav")
