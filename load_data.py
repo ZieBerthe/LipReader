@@ -2,7 +2,7 @@ import os
 import cv2
 import numpy as np
 import torch 
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 from matplotlib import pyplot as plt
 import imageio
 import gdown
@@ -11,22 +11,16 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import librosa
 import soundfile as sf
+from audio_config import get_audio_config
 torch.device('cuda' if torch.cuda.is_available() else 'cpu') 
 # MediaPipe for face mesh and landmark detection
+# Model path for MediaPipe
 model_path = "models/face_landmarker.task"  # path to downloaded model
-
 BaseOptions = mp.tasks.BaseOptions
 FaceLandmarker = vision.FaceLandmarker
 FaceLandmarkerOptions = vision.FaceLandmarkerOptions
 VisionRunningMode = vision.RunningMode
 
-options = FaceLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=model_path),
-    running_mode=VisionRunningMode.VIDEO,
-    num_faces=1
-)
-
-landmarker = FaceLandmarker.create_from_options(options)
 #for the vocabulary, and loss calculation purpose
 vocab = [x for x in "abcdefghijklmnopqrstuvwxyz'?!1234567890 "]
 char_to_num = {char: idx for idx, char in enumerate((vocab))}
@@ -89,19 +83,22 @@ def load_video(video_path: str, padding_ratio: float = 0.8, target_size: Tuple[i
     Returns:
         List of cropped and resized mouth frames
     """
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionRunningMode.VIDEO,
+        num_faces=1
+    )
+    landmarker = FaceLandmarker.create_from_options(options)
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Failed to open video file: {video_path}")
-    
-    # Get actual video FPS
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps == 0:
-        fps = 25.0  # Default fallback
-    frame_time_ms = int(1000 / fps)
-    
+
+    # Use a fixed increment for timestamp to guarantee monotonicity (e.g., 40ms per frame = 25 FPS)
+    TIMESTAMP_INCREMENT_MS = 40
     frames = []
     frame_idx = 0
     last_valid_mouth = None
+    timestamp_ms = 0
 
     while True:
         ret, frame = cap.read()
@@ -116,10 +113,10 @@ def load_video(video_path: str, padding_ratio: float = 0.8, target_size: Tuple[i
             data=rgb_frame
         )
 
-        # timestamp must increase for VIDEO mode
+        # Use strictly increasing timestamp (fixed increment per frame)
         results = landmarker.detect_for_video(
             mp_image,
-            timestamp_ms=frame_idx * frame_time_ms
+            timestamp_ms=timestamp_ms
         )
 
         if results.face_landmarks:
@@ -127,7 +124,7 @@ def load_video(video_path: str, padding_ratio: float = 0.8, target_size: Tuple[i
             landmark_tuples = [(lm.x, lm.y, lm.z) for lm in landmarks]
 
             mouth = _crop_mouth(gray, landmark_tuples, padding_ratio)
-            
+
             # Validate and resize the cropped mouth
             if mouth.size > 0 and mouth.shape[0] > 0 and mouth.shape[1] > 0:
                 # Use INTER_AREA for better quality when downscaling
@@ -145,16 +142,16 @@ def load_video(video_path: str, padding_ratio: float = 0.8, target_size: Tuple[i
                 print(f"Warning: No face detected in frame {frame_idx}")
 
         frame_idx += 1
+        timestamp_ms += TIMESTAMP_INCREMENT_MS
 
     cap.release()
-    
+
     if not frames:
         raise ValueError(f"No valid mouth frames extracted from {video_path}")
-    
-    print(f"Video FPS: {fps:.2f}, Total frames extracted: {len(frames)}")
 
-    # Normalize with torch to keep everything on the same side of the fence.
-    frames_tensor = torch.tensor(frames, dtype=torch.float32)
+    print(f"Total frames extracted: {len(frames)}")
+
+    frames_tensor = torch.tensor(np.array(frames), dtype=torch.float32)
     mean = frames_tensor.mean()
     std = frames_tensor.std()
     return (frames_tensor - mean) / std if std > 0 else frames_tensor
@@ -177,30 +174,28 @@ def load_alignment(alignment_path: str) -> List[int]:
 
 def load_audio(
     video_path: str,
-    sr: int = 16000,
-    n_mels: int = 128,
-    hop_length: int | None = None,
-    win_length: int | None = None,
-) -> Tuple[np.ndarray, np.ndarray, int, int, float, float, int, int]:
-    """Load audio from video file and extract log-mel features.
+    audio_config: Dict[str, Any] | None = None,
+) -> torch.Tensor:
+    """Load audio from video file and extract STFT magnitude.
+    
+    Uses global audio config for all parameters (sr, hop_length, etc.) and normalization.
     
     Args:
         video_path: Path to video file
-        sr: Sample rate for audio processing
-        n_mels: Number of mel bins
-        hop_length: Hop length in samples (auto-aligned to video FPS if None)
-        win_length: Window length in samples (defaults to 2 * hop_length if None)
+        audio_config: Audio config dict (if None, loads from audio_config.json)
 
     Returns:
-        Tuple of (log_mel_features, waveform, sample_rate, hop_length,
-        log_mel_mean, log_mel_std, n_fft, win_length)
+        Normalized STFT magnitude tensor
     """
-    # Use fixed hop/win for better audio quality
-    # Alignment to video frames can be done via interpolation if needed
-    if hop_length is None:
-        hop_length = 160  # 10ms at 16kHz - good for quality
-    if win_length is None:
-        win_length = 400  # 25ms at 16kHz
+    if audio_config is None:
+        audio_config = get_audio_config()
+    
+    sr = audio_config['sr']
+    hop_length = audio_config['hop_length']
+    win_length = audio_config['win_length']
+    n_fft = audio_config['n_fft']
+    global_mean = audio_config.get('mag_mean', 0.0)
+    global_std = audio_config.get('mag_std', 1.0)
 
     try:
         # Load audio from video
@@ -211,35 +206,115 @@ def load_audio(
     if y.size == 0:
         raise ValueError(f"No audio samples found in {video_path}.")
 
-    # Extract log-mel features (better target for reconstruction than MFCCs)
-    mel = librosa.feature.melspectrogram(
+    # Compute STFT (returns complex-valued spectrogram)
+    stft_complex = librosa.stft(
         y=y,
-        sr=sr_loaded,
-        n_mels=n_mels,
+        n_fft=n_fft,
         hop_length=hop_length,
         win_length=win_length,
-        power=2.0,
+        window='hann',
+        center=True,
+        pad_mode='reflect'
     )
-    log_mel = np.log(np.maximum(mel, 1e-10)).T
+    
+    # Extract magnitude only (phase not needed - Griffin-Lim will estimate it)
+    magnitude = np.abs(stft_complex).T  # (time, freq)
+    
+    # Apply log compression to magnitude for better numerical stability
+    log_magnitude = np.log1p(magnitude)  # log(1 + x) is more stable than log(x)
+    
+    # Normalize magnitude using global stats
+    mag_tensor = torch.tensor(log_magnitude, dtype=torch.float32)
+    mag_normalized = (mag_tensor - global_mean) / global_std if global_std > 0 else mag_tensor
 
-    # Normalize
-    mel_tensor = torch.tensor(log_mel, dtype=torch.float32)
-    mean = mel_tensor.mean().item()
-    std = mel_tensor.std().item()
-    mel_normalized = (mel_tensor - mean) / std if std > 0 else mel_tensor
+    return mag_normalized
 
-    n_fft = max(1024, win_length)
-
-    return mel_normalized, y, sr_loaded, hop_length, mean, std, n_fft, win_length
-
-def save_audio_from_video(video_path: str, output_wav_path: str, sr: int = 16000) -> None:
+def save_audio_from_video(video_path: str, output_wav_path: str, audio_config: Dict[str, Any] | None = None) -> None:
     """Extract audio from a video and save as WAV.
 
-    This preserves the original waveform (resampled to sr) instead of reconstructing from MFCCs.
+    This preserves the original waveform.
     """
-    _, y, sr_loaded, _, _, _, _, _ = load_audio(video_path, sr=sr)
-    sf.write(output_wav_path, y, sr_loaded)
+    if audio_config is None:
+        audio_config = get_audio_config()
+    
+    sr = audio_config['sr']
+    y, _ = librosa.load(video_path, sr=sr)
+    sf.write(output_wav_path, y, sr)
 
+def reconstruct_audio_from_magnitude_only(
+    log_magnitude_normalized: np.ndarray | torch.Tensor,
+    magnitude_mean: float,
+    magnitude_std: float,
+    sr: int,
+    hop_length: int,
+    win_length: int,
+    n_fft: int,
+    n_iter: int = 60,
+) -> np.ndarray:
+    """Reconstruct audio from STFT magnitude only using Griffin-Lim (no phase needed).
+    
+    Use this when your model predicts magnitude only.
+    Better than mel-based Griffin-Lim, but still has some artifacts.
+    """
+    if isinstance(log_magnitude_normalized, torch.Tensor):
+        log_magnitude_normalized = log_magnitude_normalized.cpu().numpy()
+
+    # Denormalize magnitude
+    log_magnitude = (log_magnitude_normalized * magnitude_std) + magnitude_mean
+    magnitude = np.expm1(log_magnitude)  # inverse of log1p
+    
+    # Griffin-Lim on STFT magnitude
+    # (time, freq) -> (freq, time) for librosa
+    y = librosa.griffinlim(
+        magnitude.T,
+        n_iter=n_iter,
+        hop_length=hop_length,
+        win_length=win_length,
+        window='hann',
+        center=True,
+        length=None
+    )
+    return y
+
+def reconstruct_audio_from_stft(
+    log_magnitude_normalized: np.ndarray | torch.Tensor,
+    phase: np.ndarray | torch.Tensor,
+    magnitude_mean: float,
+    magnitude_std: float,
+    sr: int,
+    hop_length: int,
+    win_length: int,
+    n_fft: int,
+) -> np.ndarray:
+    """Reconstruct audio from normalized STFT magnitude and phase using inverse STFT.
+    
+    This provides perfect reconstruction (no Griffin-Lim noise) since we preserve phase.
+    Use this for testing/validation with ground truth data.
+    """
+    if isinstance(log_magnitude_normalized, torch.Tensor):
+        log_magnitude_normalized = log_magnitude_normalized.cpu().numpy()
+    if isinstance(phase, torch.Tensor):
+        phase = phase.cpu().numpy()
+
+    # Denormalize magnitude
+    log_magnitude = (log_magnitude_normalized * magnitude_std) + magnitude_mean
+    magnitude = np.expm1(log_magnitude)  # inverse of log1p
+    
+    # Reconstruct complex STFT from magnitude and phase
+    # (time, freq) -> (freq, time) for librosa
+    stft_complex = magnitude.T * np.exp(1j * phase.T)
+    
+    # Inverse STFT for perfect reconstruction
+    y = librosa.istft(
+        stft_complex,
+        hop_length=hop_length,
+        win_length=win_length,
+        window='hann',
+        center=True,
+    )
+    return y
+
+# Legacy function kept for backward compatibility
 def reconstruct_audio_from_log_mel(
     log_mel_normalized: np.ndarray | torch.Tensor,
     log_mel_mean: float,
@@ -250,7 +325,10 @@ def reconstruct_audio_from_log_mel(
     n_fft: int,
     n_iter: int = 192,
 ) -> np.ndarray:
-    """Reconstruct audio from normalized log-mel features using Griffin-Lim."""
+    """Reconstruct audio from normalized log-mel features using Griffin-Lim.
+    
+    WARNING: This method produces noisy results. Use reconstruct_audio_from_stft instead.
+    """
     if isinstance(log_mel_normalized, torch.Tensor):
         log_mel_normalized = log_mel_normalized.cpu().numpy()
 
@@ -296,72 +374,76 @@ def align_audio_to_video(
 #         if len(parts) >= 3 and parts[2] != 'sil':
 #             tokens = [*tokens,' ', parts[2]]
 #     return encode_chars(torch.reshaped(torch.strings.unicode_split(tokens,input_encoding='UTF-8'),(-1,)).tolist())
+
 def load_data(
     video_path: str,
     alignment_path: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int, float, float, int, int, List[int]]:
+    audio_config: Dict[str, Any] | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
     """Load video, audio and alignment data.
+    
+    Uses global audio config for consistent processing.
     
     Args:
         video_path: Path to video file
         alignment_path: Path to alignment file
+        audio_config: Audio config dict (if None, loads from audio_config.json)
         
     Returns:
-        Tuple of (mouth_frames, audio_log_mel, audio_waveform, audio_sr, hop_length,
-        log_mel_mean, log_mel_std, n_fft, win_length, char_indices)
+        Tuple of (mouth_frames, audio_stft_magnitude, char_indices)
     """
+    if audio_config is None:
+        audio_config = get_audio_config()
+    
     mouth_frames = load_video(video_path)
-    audio_log_mel, audio_waveform, audio_sr, hop_length, log_mel_mean, log_mel_std, n_fft, win_length = load_audio(video_path)
+    audio_stft_mag = load_audio(video_path, audio_config)
     char_indices = load_alignment(alignment_path)
+    
     return (
         mouth_frames,
-        audio_log_mel,
-        audio_waveform,
-        audio_sr,
-        hop_length,
-        log_mel_mean,
-        log_mel_std,
-        n_fft,
-        win_length,
+        audio_stft_mag,
         char_indices,
     )
+
 if __name__ == "__main__":
     print("Vocabulary size:", len(vocab))
+    
+    # Load global audio config
+    audio_config = get_audio_config()
+    print(f"\nAudio config: {audio_config}")
+    
     preprocessed = load_data(
-        video_path='data/s1/bbaf3s.mpg', 
-        alignment_path='data/alignments/s1/bbaf3s.align'
+        video_path='data/s1/bbaf2n.mpg', 
+        alignment_path='data/alignments/s1/bbaf2n.align',
+        audio_config=audio_config
     )
     
     (
         mouth_frames,
-        audio_log_mel,
-        audio_waveform,
-        audio_sr,
-        hop_length,
-        log_mel_mean,
-        log_mel_std,
-        n_fft,
-        win_length,
+        audio_stft_mag,
         char_indices,
     ) = preprocessed
-    print(f'Mouth frames shape: {mouth_frames.shape}')
-    print(f'Audio log-mel shape: {audio_log_mel.shape}')
+    
+    print(f'\nMouth frames shape: {mouth_frames.shape}')
+    print(f'Audio STFT magnitude shape: {audio_stft_mag.shape}')
     print(f'Character indices length: {len(char_indices)}')
     print(f'Character sequence: {decode_indices(char_indices)}')
-    # Save extracted audio for verification
-    # save_audio_from_video('data/s1/bbaf3s.mpg', 'extracted_audio.wav', sr=audio_sr)
-    # check loaded audio
-    print(f'Extracted audio waveform shape: {audio_waveform.shape}, Sample rate: {audio_sr}')
-    # reconstruct audio from log-mel features to verify correctness
-    y_reconstructed = reconstruct_audio_from_log_mel(
-        audio_log_mel,
-        log_mel_mean,
-        log_mel_std,
-        sr=audio_sr,
-        hop_length=hop_length,
-        win_length=win_length,
-        n_fft=n_fft,
-        n_iter=128,
+    
+    # Save original audio for comparison
+    save_audio_from_video('data/s1/bbaf2n.mpg', 'original_audio.wav', audio_config)
+    print("\nSaved original audio to original_audio.wav")
+    
+    # Reconstruct with magnitude only (Griffin-Lim)
+    y_reconstructed_magnitude_only = reconstruct_audio_from_magnitude_only(
+        audio_stft_mag,
+        audio_config['mag_mean'],
+        audio_config['mag_std'],
+        sr=audio_config['sr'],
+        hop_length=audio_config['hop_length'],
+        win_length=audio_config['win_length'],
+        n_fft=audio_config['n_fft'],
+        n_iter=60,
     )
-    sf.write('reconstructed_audiobbaf3s.wav', y_reconstructed, audio_sr)
-    print("Saved reconstructed audio to reconstructed_audio.wav")
+    sf.write('reconstructed_magnitude_only.wav', y_reconstructed_magnitude_only, audio_config['sr'])
+    print("Saved reconstructed_magnitude_only.wav (uses Griffin-Lim)")
+    print("\nCompare original vs reconstructed to verify quality!")
