@@ -22,9 +22,11 @@ FaceLandmarkerOptions = vision.FaceLandmarkerOptions
 VisionRunningMode = vision.RunningMode
 
 #for the vocabulary, and loss calculation purpose
+# Reserve index 0 for padding/blank token
 vocab = [x for x in "abcdefghijklmnopqrstuvwxyz'?!1234567890 "]
-char_to_num = {char: idx for idx, char in enumerate((vocab))}
+char_to_num = {char: idx + 1 for idx, char in enumerate(vocab)}  # Start from index 1
 num_to_char = {idx: char for char, idx in char_to_num.items()}
+num_to_char[0] = ''  # Index 0 is padding/blank (empty string)
 def encode_chars(chars):
     """Convert list of characters to indices"""
     return [char_to_num[c] for c in chars]

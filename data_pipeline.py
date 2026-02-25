@@ -40,7 +40,6 @@ def collate_fn(batch):
     mouth_seqs = [item['mouth_frames'] for item in batch]
     text_seqs = [item['char_indices'] for item in batch]
     audio_mag_seqs = [item['audio_stft_magnitude'] for item in batch]
-    audio_phase_seqs = [item['audio_stft_phase'] for item in batch]
     
     mouth_lens = [seq.shape[0] for seq in mouth_seqs]
     max_mouth_len = max(mouth_lens)
@@ -62,10 +61,6 @@ def collate_fn(batch):
         torch.nn.functional.pad(seq, (0, 0, 0, max_audio_len - seq.shape[0]))
         for seq in audio_mag_seqs
     ])
-    audio_phase_padded = torch.stack([
-        torch.nn.functional.pad(seq, (0, 0, 0, max_audio_len - seq.shape[0]))
-        for seq in audio_phase_seqs
-    ])
     
     return {
         'mouth_frames': mouth_padded,  # (B, T, H, W)
@@ -73,10 +68,8 @@ def collate_fn(batch):
         'char_indices': text_padded,  # (B, L)
         'text_lengths': torch.tensor(text_lens),
         'audio_stft_magnitude': audio_mag_padded,  # (B, A, F)
-        'audio_stft_phase': audio_phase_padded,     # (B, A, F)
         'audio_lengths': torch.tensor(audio_lens),
-        'video_paths': [item['video_path'] for item in batch],
-        'audio_params': batch[0]['audio_params']  # Assuming same params for all
+        'video_paths': [item['video_path'] for item in batch]
     }
 
 if __name__ == "__main__":
