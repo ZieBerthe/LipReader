@@ -5,3 +5,8 @@ data/
 *.mpg# pixi environments
 .pixi/*
 !.pixi/config.toml
+# pixi environments
+.pixi/*
+*.pth
+*.pt
+!.pixi/config.toml

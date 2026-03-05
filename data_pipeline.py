@@ -35,39 +35,45 @@ class LipReadingDataset(Dataset):
             'video_path': video_path,
         }
 
+# Global maximum lengths - ensures all batches have same output size
+MAX_MOUTH_FRAMES = 75  # Maximum number of video frames
+MAX_TEXT_LENGTH = 40   # Maximum text sequence length
+MAX_AUDIO_FRAMES = 300 # Maximum audio STFT frames
+
 # Collate function for batching and padding
 def collate_fn(batch):
     mouth_seqs = [item['mouth_frames'] for item in batch]
     text_seqs = [item['char_indices'] for item in batch]
     audio_mag_seqs = [item['audio_stft_magnitude'] for item in batch]
     
+    # Get actual lengths before padding
     mouth_lens = [seq.shape[0] for seq in mouth_seqs]
-    max_mouth_len = max(mouth_lens)
+    text_lens = [seq.shape[0] for seq in text_seqs]
+    audio_lens = [seq.shape[0] for seq in audio_mag_seqs]
+    
+    # Pad to GLOBAL max length (not batch-specific max)
+    # This ensures all batches have the same tensor size
     mouth_padded = torch.stack([
-        torch.nn.functional.pad(seq, (0, 0, 0, 0, 0, max_mouth_len - seq.shape[0]))
+        torch.nn.functional.pad(seq, (0, 0, 0, 0, 0, MAX_MOUTH_FRAMES - seq.shape[0]))
         for seq in mouth_seqs
     ])
     
-    text_lens = [seq.shape[0] for seq in text_seqs]
-    max_text_len = max(text_lens)
     text_padded = torch.stack([
-        torch.nn.functional.pad(seq, (0, max_text_len - seq.shape[0]))
+        torch.nn.functional.pad(seq, (0, MAX_TEXT_LENGTH - seq.shape[0]))
         for seq in text_seqs
     ])
     
-    audio_lens = [seq.shape[0] for seq in audio_mag_seqs]
-    max_audio_len = max(audio_lens)
     audio_mag_padded = torch.stack([
-        torch.nn.functional.pad(seq, (0, 0, 0, max_audio_len - seq.shape[0]))
+        torch.nn.functional.pad(seq, (0, 0, 0, MAX_AUDIO_FRAMES - seq.shape[0]))
         for seq in audio_mag_seqs
     ])
     
     return {
-        'mouth_frames': mouth_padded,  # (B, T, H, W)
+        'mouth_frames': mouth_padded,  # (B, MAX_MOUTH_FRAMES, H, W)
         'mouth_lengths': torch.tensor(mouth_lens),
-        'char_indices': text_padded,  # (B, L)
+        'char_indices': text_padded,  # (B, MAX_TEXT_LENGTH)
         'text_lengths': torch.tensor(text_lens),
-        'audio_stft_magnitude': audio_mag_padded,  # (B, A, F)
+        'audio_stft_magnitude': audio_mag_padded,  # (B, MAX_AUDIO_FRAMES, F)
         'audio_lengths': torch.tensor(audio_lens),
         'video_paths': [item['video_path'] for item in batch]
     }
@@ -84,7 +90,7 @@ if __name__ == "__main__":
     train_len = min(450, int(0.9 * total_len))
     test_len = total_len - train_len
     train_set, test_set = random_split(dataset, [train_len, test_len], generator=torch.Generator().manual_seed(42))
-    batch_size = 2
+    batch_size = 10
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
@@ -137,7 +143,18 @@ if __name__ == "__main__":
     print('Saved reconstructed_audio_pipeline.wav (uses Griffin-Lim)')
     
     # Show a specific frame (e.g., frame 35)
-    frame_idx = 35 if first_video_frames.shape[0] > 35 else 0
+    frame_idx = 13 if first_video_frames.shape[0] > 35 else 0
     plt.imshow(first_video_frames[frame_idx], cmap='gray')
     plt.title(f'Frame {frame_idx} of first video')
     plt.show()
+    # print data type, shape, batch size, feature dimensions, labels, and label shapes
+    print('Data type of mouth frames:', batch['mouth_frames'].dtype)
+    print('Shape of mouth frames:', batch['mouth_frames'].shape)
+    print('Batch size:', batch['mouth_frames'].shape[0])
+    print('Feature dimensions (H, W):', batch['mouth_frames'].shape[2], batch['mouth_frames'].shape[3])
+    print('Data type of char indices:', batch['char_indices'].dtype)
+    print('Shape of char indices:', batch['char_indices'].shape)
+    print('Data type of audio STFT magnitude:', batch['audio_stft_magnitude'].dtype)
+    print('Shape of audio STFT magnitude:', batch['audio_stft_magnitude'].shape)
+    print('Audio feature dimensions (A, F):', batch['audio_stft_magnitude'].shape[1], batch['audio_stft_magnitude'].shape[2])
+    

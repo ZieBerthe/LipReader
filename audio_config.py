@@ -8,10 +8,10 @@ from tqdm import tqdm
 
 # Global audio parameters (fixed for all samples)
 AUDIO_CONFIG = {
-    'sr': 8000,
-    'hop_length': 80,
-    'win_length': 200,
-    'n_fft': 256,
+    'sr': 6000,
+    'hop_length': 60,
+    'win_length': 180,
+    'n_fft': 200,
     'mag_mean': None,  # Computed from dataset
     'mag_std': None,   # Computed from dataset
 }
@@ -106,5 +106,5 @@ def get_audio_config() -> Dict[str, Any]:
 if __name__ == "__main__":
     # Example: Compute stats from training data
     video_dir = 'data/s1'
-    config = compute_global_audio_stats(video_dir, max_samples=100)  # Use first 100 videos
+    config = compute_global_audio_stats(video_dir, max_samples=400)  # Use first 100 videos
     print("\nConfig:", config)

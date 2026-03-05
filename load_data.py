@@ -1,4 +1,14 @@
 import os
+import warnings
+import logging
+
+# Suppress mediapipe and absl warnings
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', message='.*Sets FaceBlendshapesGraph.*')
+warnings.filterwarnings('ignore', message='.*Feedback manager.*')
+logging.getLogger('mediapipe').setLevel(logging.ERROR)
+logging.getLogger('absl').setLevel(logging.ERROR)
+
 import cv2
 import numpy as np
 import torch 
@@ -428,6 +438,7 @@ if __name__ == "__main__":
     
     print(f'\nMouth frames shape: {mouth_frames.shape}')
     print(f'Audio STFT magnitude shape: {audio_stft_mag.shape}')
+    print( 'audio_stft_mag', audio_stft_mag)
     print(f'Character indices length: {len(char_indices)}')
     print(f'Character sequence: {decode_indices(char_indices)}')
     
