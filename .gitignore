@@ -10,3 +10,6 @@ data/
 *.pth
 *.pt
 !.pixi/config.toml
+
+*.wav
+*.gif
