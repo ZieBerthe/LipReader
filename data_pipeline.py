@@ -8,24 +8,88 @@ import imageio
 from load_data import load_data, decode_indices, encode_chars, char_to_num, num_to_char
 
 
+# ---- Data root (absolute path – do NOT auto-detect) ----
+GRID_CORPUS_ROOT = '/Data/grid_corpus'
+
+
 # Custom Dataset for LipReading (text + word timing prediction)
 class LipReadingDataset(Dataset):
-    def __init__(self, video_dir, align_dir):
-        self.video_paths = sorted(glob.glob(os.path.join(video_dir, '*.mpg')))
-        self.align_paths = [
-            os.path.join(align_dir, os.path.splitext(os.path.basename(v))[0] + '.align')
-            for v in self.video_paths
-        ]
+    def __init__(self, corpus_root=GRID_CORPUS_ROOT, cache_root=None, use_cache=True):
+        """
+        Args:
+            corpus_root: Root directory containing s*_processed/ speaker folders.
+                         Each folder has .mpg files and an align/ subfolder with .align files.
+            cache_root:  Root directory for cached preprocessed data.
+                         Defaults to <corpus_root>/../grid_corpus_cache
+            use_cache:   Whether to use cached data (much faster!)
+        """
+        self.corpus_root = corpus_root
+        self.video_paths = []
+        self.align_paths = []
+        self.cache_paths = []
+
+        if cache_root is None:
+            cache_root = os.path.join(os.path.dirname(corpus_root), 'grid_corpus_cache')
+        self.cache_root = cache_root
+
+        # Discover all speaker folders
+        speaker_dirs = sorted(glob.glob(os.path.join(corpus_root, 's*_processed')))
+        if not speaker_dirs:
+            raise FileNotFoundError(f"No s*_processed folders found in {corpus_root}")
+
+        for speaker_dir in speaker_dirs:
+            speaker_name = os.path.basename(speaker_dir)  # e.g. s1_processed
+            align_dir = os.path.join(speaker_dir, 'align')
+            cache_dir = os.path.join(cache_root, speaker_name)
+
+            videos = sorted(glob.glob(os.path.join(speaker_dir, '*.mpg')))
+            for v in videos:
+                vname = os.path.splitext(os.path.basename(v))[0]
+                self.video_paths.append(v)
+                self.align_paths.append(os.path.join(align_dir, f"{vname}.align"))
+                self.cache_paths.append(os.path.join(cache_dir, f"{vname}.pt"))
+
+        self.use_cache = use_cache
+
+        if self.use_cache:
+            cached_count = sum(1 for p in self.cache_paths if os.path.exists(p))
+            if cached_count < len(self.video_paths):
+                print(f"⚠ Warning: Only {cached_count}/{len(self.video_paths)} videos cached.")
+                print(f"  Run 'python preprocess_cache.py' to cache all videos for faster loading.")
+            else:
+                print(f"✓ All {cached_count} videos cached.")
+
+        print(f"Dataset: {len(self.video_paths)} videos from {len(speaker_dirs)} speakers")
 
     def __len__(self):
         return len(self.video_paths)
 
     def __getitem__(self, idx):
         video_path = self.video_paths[idx]
+        cache_path = self.cache_paths[idx]
+        
+        # Try to load from cache first
+        if self.use_cache and os.path.exists(cache_path):
+            data = torch.load(cache_path)
+            return {
+                'mouth_frames': data['mouth_frames'],
+                'char_indices': torch.tensor(data['char_indices'], dtype=torch.long) if not isinstance(data['char_indices'], torch.Tensor) else data['char_indices'],
+                'frame_word_labels': data['frame_word_labels'],
+                'word_timings': data['word_timings'],
+                'video_path': video_path,
+            }
+        
+        # Fallback to on-the-fly processing — skip bad videos gracefully
         align_path = self.align_paths[idx]
-        mouth_frames, char_indices, frame_word_labels, word_timings = load_data(
-            video_path, align_path
-        )
+        try:
+            mouth_frames, char_indices, frame_word_labels, word_timings = load_data(
+                video_path, align_path
+            )
+        except Exception:
+            # Video is broken (no face detected, etc.) — return a random cached sample
+            import random
+            alt_idx = random.randint(0, len(self.video_paths) - 1)
+            return self.__getitem__(alt_idx)
         return {
             'mouth_frames': mouth_frames,                                       # (T, H, W)
             'char_indices': torch.tensor(char_indices, dtype=torch.long),       # (L,)
@@ -37,7 +101,7 @@ class LipReadingDataset(Dataset):
 
 # Global maximum dimensions for padding
 MAX_MOUTH_FRAMES = 75   # Maximum number of video frames
-MAX_TEXT_LENGTH = 40     # Maximum text sequence length
+MAX_TEXT_LENGTH = 50     # Maximum text sequence length (longest in GRID is 42)
 MAX_WORDS = 10           # Maximum number of words per sentence (GRID has 6)
 
 
@@ -46,6 +110,11 @@ def collate_fn(batch):
     mouth_seqs = [item['mouth_frames'] for item in batch]
     text_seqs = [item['char_indices'] for item in batch]
     timing_seqs = [item['frame_word_labels'] for item in batch]
+
+    # Truncate anything that exceeds max lengths
+    mouth_seqs = [s[:MAX_MOUTH_FRAMES] for s in mouth_seqs]
+    text_seqs = [s[:MAX_TEXT_LENGTH] for s in text_seqs]
+    timing_seqs = [s[:MAX_MOUTH_FRAMES] for s in timing_seqs]
 
     mouth_lens = [seq.shape[0] for seq in mouth_seqs]
     text_lens = [seq.shape[0] for seq in text_seqs]
@@ -80,11 +149,9 @@ def collate_fn(batch):
 
 
 if __name__ == "__main__":
-    video_dir = 'data/s1'
-    align_dir = 'data/alignments/s1'
-    dataset = LipReadingDataset(video_dir, align_dir)
+    dataset = LipReadingDataset(corpus_root=GRID_CORPUS_ROOT)
     total_len = len(dataset)
-    train_len = min(450, int(0.9 * total_len))
+    train_len = int(0.7 * total_len)
     test_len = total_len - train_len
     train_set, test_set = random_split(
         dataset, [train_len, test_len],

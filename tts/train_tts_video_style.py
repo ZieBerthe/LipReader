@@ -163,18 +163,44 @@ class TextEncoder(nn.Module):
 
 
 class VideoStyleEncoder(nn.Module):
-    """Per-frame 2-D CNN → temporal mean-pool → FC → style vector."""
+    """Per-frame 2-D CNN → BiLSTM → attention pool → style vector.
+
+    Instead of simple mean-pooling (which loses all temporal dynamics),
+    we run a BiLSTM over the per-frame CNN features and use a small
+    attention layer to produce a single global style vector that captures
+    speaking rhythm, pace and emphasis patterns from the video.
+    """
 
     def __init__(self, style_dim=STYLE_DIM):
         super().__init__()
+        cnn_out = 128
+
+        # Spatial feature extraction (per frame)
         self.cnn = nn.Sequential(
             nn.Conv2d(1,  32, 3, stride=2, padding=1), nn.ReLU(),
             nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),               # (B*T, 128, 1, 1)
+            nn.Conv2d(64, cnn_out, 3, stride=2, padding=1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),                # → (B*T, 128, 1, 1)
         )
-        self.fc = nn.Sequential(
-            nn.Linear(128, style_dim),
+
+        # Temporal modelling: captures rhythm / speaking rate
+        self.lstm = nn.LSTM(
+            input_size=cnn_out,
+            hidden_size=style_dim // 2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        # Attention pooling over time (learns *which* frames matter most)
+        self.attn = nn.Sequential(
+            nn.Linear(style_dim, style_dim),
+            nn.Tanh(),
+            nn.Linear(style_dim, 1),            # score per frame
+        )
+
+        self.out_proj = nn.Sequential(
+            nn.Linear(style_dim, style_dim),
             nn.ReLU(),
         )
 
@@ -187,20 +213,36 @@ class VideoStyleEncoder(nn.Module):
             style: (B, style_dim)
         """
         B, T, H, W = frames.shape
+
+        # ---- Per-frame spatial features ----
         x = frames.reshape(B * T, 1, H, W)
         x = self.cnn(x).squeeze(-1).squeeze(-1)          # (B*T, 128)
         x = x.view(B, T, -1)                             # (B, T, 128)
 
-        # Mean-pool only over valid frames
+        # ---- Temporal modelling (BiLSTM) ----
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x, frame_lengths.cpu().clamp(min=1),
+            batch_first=True, enforce_sorted=False,
+        )
+        lstm_out, _ = self.lstm(packed)
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(   # (B, T, style_dim)
+            lstm_out, batch_first=True, total_length=T,
+        )
+
+        # ---- Attention pooling (learns which frames are important) ----
         mask = (
             torch.arange(T, device=frames.device)
-            .unsqueeze(0)
-            .expand(B, -1)
+            .unsqueeze(0).expand(B, -1)
             < frame_lengths.unsqueeze(1)
-        ).float().unsqueeze(-1)                           # (B, T, 1)
-        pooled = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)  # (B, 128)
+        )                                                 # (B, T) bool
 
-        return self.fc(pooled)                            # (B, style_dim)
+        scores = self.attn(lstm_out).squeeze(-1)          # (B, T)
+        scores = scores.masked_fill(~mask, float("-inf"))
+        weights = torch.softmax(scores, dim=1).unsqueeze(-1)  # (B, T, 1)
+
+        pooled = (lstm_out * weights).sum(dim=1)          # (B, style_dim)
+
+        return self.out_proj(pooled)                      # (B, style_dim)
 
 
 class MelDecoder(nn.Module):
@@ -403,7 +445,7 @@ def main():
     # ---- Dataset / loaders ----
     dataset = TTSDataset(args.manifest)
     total = len(dataset)
-    train_n = max(1, int(0.9 * total))
+    train_n = int(0.7 * total)
     test_n  = total - train_n
     train_set, test_set = random_split(
         dataset, [train_n, test_n],

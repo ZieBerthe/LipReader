@@ -91,22 +91,38 @@ def extract_text(alignment_path: str) -> str:
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
+GRID_CORPUS_ROOT = '/Data/grid_corpus'
+
+
 def main():
     parser = argparse.ArgumentParser(description="Preprocess GRID data for TTS")
-    parser.add_argument("--video_dir",  default=os.path.join(ROOT, "data", "s1"))
-    parser.add_argument("--align_dir",  default=os.path.join(ROOT, "data", "alignments", "s1"))
-    parser.add_argument("--output_dir", default=os.path.join(ROOT, "tts", "prepped"))
+    parser.add_argument("--corpus_root", default=GRID_CORPUS_ROOT)
+    parser.add_argument("--output_dir",  default=os.path.join(ROOT, "tts", "prepped"))
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Limit number of samples (for quick testing)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    video_paths = sorted(glob.glob(os.path.join(args.video_dir, "*.mpg")))
+    # Discover all speaker folders and collect (video, align) pairs
+    speaker_dirs = sorted(glob.glob(os.path.join(args.corpus_root, 's*_processed')))
+    if not speaker_dirs:
+        raise FileNotFoundError(f"No s*_processed folders in {args.corpus_root}")
+
+    video_paths = []
+    align_lookup = {}  # video_path → align_path
+    for spk_dir in speaker_dirs:
+        align_dir = os.path.join(spk_dir, 'align')
+        for v in sorted(glob.glob(os.path.join(spk_dir, '*.mpg'))):
+            vid_id = os.path.splitext(os.path.basename(v))[0]
+            align_path = os.path.join(align_dir, vid_id + '.align')
+            video_paths.append(v)
+            align_lookup[v] = align_path
+
     if args.max_samples:
         video_paths = video_paths[: args.max_samples]
 
-    print(f"Found {len(video_paths)} videos in {args.video_dir}")
+    print(f"Found {len(video_paths)} videos across {len(speaker_dirs)} speakers")
 
     # Save mel config so train / infer scripts stay consistent
     mel_config = dict(
@@ -124,7 +140,7 @@ def main():
     with open(manifest_path, "w") as mf:
         for video_path in tqdm(video_paths, desc="Preprocessing"):
             vid_id = os.path.splitext(os.path.basename(video_path))[0]
-            align_path = os.path.join(args.align_dir, vid_id + ".align")
+            align_path = align_lookup[video_path]
             if not os.path.exists(align_path):
                 skipped += 1
                 continue

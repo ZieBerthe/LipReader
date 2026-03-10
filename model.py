@@ -35,113 +35,95 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import  tqdm
 
 
-from load_data import decode_indices, encode_chars, char_to_num, num_to_char, VIDEO_FPS
+from load_data import load_video, decode_indices, encode_chars, char_to_num, num_to_char, VIDEO_FPS
 from data_pipeline import LipReadingDataset, collate_fn, MAX_MOUTH_FRAMES, MAX_TEXT_LENGTH, MAX_WORDS
 import torch.nn as nn
 import torch.optim as optim
 
 
 class LipReadingModel(nn.Module):
-    """Lip reading model that predicts text (CTC) and per-frame word timing.
+    """Lip reading model that predicts text (CTC only).
 
     Outputs:
-        text_logits:   (B, T, num_chars)       — for CTC decoding
-        timing_logits: (B, T, max_words + 1)   — per-frame word index classification
+        text_logits: (B, T, num_chars) — for CTC decoding
     """
 
     def __init__(self, num_chars, max_word_slots=MAX_WORDS):
         super(LipReadingModel, self).__init__()
+        # CNN sized for ~21k samples (31 speakers)
         self.cnn = nn.Sequential(
-            nn.Conv3d(1, 128, kernel_size=3, padding=1),
+            nn.Conv3d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm3d(32),
             nn.ReLU(),
             nn.MaxPool3d(kernel_size=(1, 2, 2)),
 
-            nn.Conv3d(128, 256, kernel_size=3, padding=1),
+            nn.Conv3d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm3d(64),
             nn.ReLU(),
             nn.MaxPool3d(kernel_size=(1, 2, 2)),
 
-            nn.Conv3d(256, 512, kernel_size=3, padding=1),
+            nn.Conv3d(64, 96, kernel_size=3, padding=1),
+            nn.BatchNorm3d(96),
             nn.ReLU(),
-            nn.MaxPool3d(kernel_size=(1, 2, 2)),  # (B, 512, T, 12, 25)
+            nn.MaxPool3d(kernel_size=(1, 2, 2)),  # (B, 96, T, 12, 25)
         )
-        self.feature_size = 512 * 12 * 25
+        # Collapse spatial dims: (B, 96, T, 12, 25) → (B, 96, T, 2, 2)
+        self.spatial_pool = nn.AdaptiveAvgPool3d((None, 2, 2))
+        self.feature_size = 96 * 2 * 2  # = 384
 
-        self.bilstm1 = nn.LSTM(
-            input_size=self.feature_size, hidden_size=256,
-            num_layers=1, batch_first=True, bidirectional=True,
+        # 2-layer BiLSTM
+        self.bilstm = nn.LSTM(
+            input_size=self.feature_size, hidden_size=128,
+            num_layers=2, batch_first=True, bidirectional=True,
+            dropout=0.3,
         )
-        self.bilstm2 = nn.LSTM(
-            input_size=512, hidden_size=256,
-            num_layers=1, batch_first=True, bidirectional=True,
-        )
 
-        # Head 1: CTC text prediction
-        self.text_head = nn.Linear(512, num_chars)
+        # CTC text prediction head
+        self.text_head = nn.Linear(256, num_chars)
 
-        # Head 2: Per-frame word index classification
-        #   class 0 = silence,  1..max_word_slots = word positions
-        self.timing_head = nn.Linear(512, max_word_slots + 1)
-
-        self.dropout1 = nn.Dropout(0.5)
-        self.dropout2 = nn.Dropout(0.5)
+        self.dropout = nn.Dropout(0.3)
 
     def forward(self, x):
         B, T, H, W = x.size()
         x = x.unsqueeze(1)  # (B, 1, T, H, W)
 
-        features = self.cnn(x)  # (B, 512, T, H', W')
+        features = self.cnn(x)  # (B, 96, T, 12, 25)
+        features = self.spatial_pool(features)                          # (B, 96, T, 2, 2)
         _, C, T_out, H_new, W_new = features.size()
         features = features.permute(0, 2, 1, 3, 4)                     # (B, T, C, H', W')
-        features = features.contiguous().view(B, T_out, -1)             # (B, T, feature_size)
+        features = features.contiguous().view(B, T_out, -1)             # (B, T, 384)
 
-        lstm_out, _ = self.bilstm1(features)   # (B, T, 512)
-        lstm_out = self.dropout1(lstm_out)
-
-        lstm_out, _ = self.bilstm2(lstm_out)   # (B, T, 512)
-        lstm_out = self.dropout2(lstm_out)
+        lstm_out, _ = self.bilstm(features)   # (B, T, 256)
+        lstm_out = self.dropout(lstm_out)
 
         text_logits = self.text_head(lstm_out)      # (B, T, num_chars)
-        timing_logits = self.timing_head(lstm_out)   # (B, T, max_words+1)
 
-        return text_logits, timing_logits
+        return text_logits
 
 
 # ---------------------------------------------------------------------------
 #  Training
 # ---------------------------------------------------------------------------
 
-def train_step(model, batch, criterion_ctc, criterion_timing, optimizer):
-    """Single training step: CTC loss for text + CrossEntropy for word timing."""
+def train_step(model, batch, criterion_ctc, optimizer, epoch=1):
+    """Single training step: CTC loss for text."""
     mouth_frames = batch['mouth_frames']
     text_targets = batch['char_indices']
-    timing_targets = batch['frame_word_labels']
     mouth_lengths = batch['mouth_lengths']
     text_lengths = batch['text_lengths']
 
-    text_logits, timing_logits = model(mouth_frames)
+    text_logits = model(mouth_frames)
 
     # ---- CTC loss for text ----
     log_probs = nn.functional.log_softmax(text_logits, dim=2).transpose(0, 1)
-    text_loss = criterion_ctc(log_probs, text_targets, mouth_lengths, text_lengths)
-
-    # ---- CrossEntropy loss for per-frame word timing ----
-    # Only compute loss on valid (non-padded) frames
-    B, T, C = timing_logits.shape
-    mask = torch.arange(T, device=mouth_frames.device).unsqueeze(0) < mouth_lengths.unsqueeze(1)
-
-    timing_loss = nn.functional.cross_entropy(
-        timing_logits[mask],          # (valid_frames, num_classes)
-        timing_targets[mask],         # (valid_frames,)
-    )
-
-    total_loss = text_loss + timing_loss
+    loss = criterion_ctc(log_probs, text_targets, mouth_lengths, text_lengths)
 
     optimizer.zero_grad()
-    total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
 
-    return total_loss.item(), text_loss.item(), timing_loss.item()
+    return loss.item(), grad_norm.item()
 
 
 # ---------------------------------------------------------------------------
@@ -167,32 +149,28 @@ def ids_to_text(ids, num_to_char_dict):
     return "".join(num_to_char_dict.get(i, "?") for i in ids)
 
 
-def extract_word_timings(frame_preds, fps=VIDEO_FPS):
-    """Convert per-frame word-index predictions to timed segments.
-
+def compute_word_accuracy(pred_text, gt_text):
+    """Compute word-level accuracy (forgiving to single char mismatches).
+    
     Args:
-        frame_preds: (T,) tensor of word indices per frame (0 = silence)
-        fps: Video frame rate
-
+        pred_text: Predicted text string
+        gt_text: Ground truth text string
+    
     Returns:
-        List of (word_index, start_sec, end_sec) tuples (silence excluded)
+        word_accuracy: Fraction of words predicted correctly
+        exact_match: Boolean, True if texts match exactly
     """
-    segments = []
-    current_word = frame_preds[0].item()
-    start_frame = 0
-
-    for i in range(1, len(frame_preds)):
-        if frame_preds[i].item() != current_word:
-            if current_word != 0:
-                segments.append((current_word, start_frame / fps, i / fps))
-            current_word = frame_preds[i].item()
-            start_frame = i
-
-    # Last segment
-    if current_word != 0:
-        segments.append((current_word, start_frame / fps, len(frame_preds) / fps))
-
-    return segments
+    pred_words = pred_text.lower().split()
+    gt_words = gt_text.lower().split()
+    
+    if len(gt_words) == 0:
+        return 1.0 if len(pred_words) == 0 else 0.0, len(pred_words) == 0
+    
+    correct = sum(1 for p, g in zip(pred_words, gt_words) if p == g)
+    word_accuracy = correct / len(gt_words)
+    exact_match = pred_text.lower() == gt_text.lower()
+    
+    return word_accuracy, exact_match
 
 
 # ---------------------------------------------------------------------------
@@ -222,15 +200,33 @@ class SilentDataLoader:
 # ---------------------------------------------------------------------------
 #  Inference
 # ---------------------------------------------------------------------------
+def run_single_test_video(model, video_path, device):
+    """Run inference on a single video and print predicted text."""
+    model.eval()
+    with torch.no_grad():
+        # Load and preprocess video
+        mouth_frames = load_video(video_path)  # (T, H, W)
+        mouth_tensor = torch.tensor(mouth_frames).unsqueeze(0).to(device)  # (1, T, H, W)
 
+        # Run model
+        text_logits = model(mouth_tensor)
+        decoded = ctc_greedy_decode(text_logits, blank_id=0)[0]
+        pred_text = ids_to_text(decoded, num_to_char)
+
+        print(f"\nVideo: {video_path}")
+        print(f"Predicted text: '{pred_text}'")
 def run_inference_examples(model, loader, device, num_examples=3):
-    """Run inference on a few samples and display text + timing predictions."""
+    """Run inference on a few samples and display text predictions with word-level accuracy."""
     model.eval()
     print("\n" + "=" * 60)
     print("INFERENCE EXAMPLES")
     print("=" * 60)
 
     count = 0
+    total_word_acc = 0.0
+    total_exact_match = 0
+    total_samples = 0
+    
     with torch.no_grad():
         for batch in loader:
             if count >= num_examples:
@@ -239,11 +235,10 @@ def run_inference_examples(model, loader, device, num_examples=3):
             mouth = batch['mouth_frames'].to(device)
             text_targets = batch['char_indices']
             text_lengths = batch['text_lengths']
-            gt_word_timings = batch['word_timings']
 
-            text_logits, timing_logits = model(mouth)
+            text_logits = model(mouth)
+            print(f"text_logits shape: {text_logits.shape}")
             decoded_batch = ctc_greedy_decode(text_logits, blank_id=0)
-            timing_preds = torch.argmax(timing_logits, dim=-1)  # (B, T)
 
             # Check for collapsed predictions
             unique_predictions = set(tuple(pred) for pred in decoded_batch)
@@ -262,33 +257,31 @@ def run_inference_examples(model, loader, device, num_examples=3):
                 # Predicted text
                 pred_text = ids_to_text(decoded_batch[i], num_to_char)
 
-                # Predicted word timings
-                pred_timings = extract_word_timings(timing_preds[i])
-
-                # Ground truth word timings
-                gt_timings = gt_word_timings[i]
+                # Word accuracy
+                word_acc, exact_match = compute_word_accuracy(pred_text, gt_text)
+                total_word_acc += word_acc
+                total_exact_match += int(exact_match)
+                total_samples += 1
 
                 print(f"\n--- Example {count + 1} ---")
                 print(f"  Video         : {batch['video_paths'][i]}")
                 print(f"  Ground truth  : '{gt_text}'")
                 print(f"  Predicted text: '{pred_text}'")
 
-                if pred_text == gt_text:
+                if exact_match:
                     print(f"  ✓ EXACT MATCH!")
                 else:
-                    correct_chars = sum(1 for a, b in zip(pred_text, gt_text) if a == b)
-                    print(f"  Char accuracy : {correct_chars}/{len(gt_text)} "
-                          f"({100 * correct_chars / max(len(gt_text), 1):.1f}%)")
-
-                print(f"  GT word timings:")
-                for word, start, end in gt_timings:
-                    print(f"    '{word}': {start:.3f}s - {end:.3f}s")
-
-                print(f"  Predicted word timings:")
-                for word_idx, start, end in pred_timings:
-                    print(f"    word_{word_idx}: {start:.3f}s - {end:.3f}s")
+                    print(f"  Word accuracy : {100 * word_acc:.1f}%")
 
                 count += 1
+    
+    if total_samples > 0:
+        avg_word_acc = total_word_acc / total_samples
+        exact_match_rate = total_exact_match / total_samples
+        print(f"\n" + "=" * 60)
+        print(f"Average word accuracy  : {100 * avg_word_acc:.1f}%")
+        print(f"Exact match rate       : {100 * exact_match_rate:.1f}%")
+        print(f"=" * 60)
 
 
 # ---------------------------------------------------------------------------
@@ -313,26 +306,25 @@ if __name__ == "__main__":
         print(f"CUDA version: {torch.version.cuda}")
 
     DEVICE     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    VIDEO_DIR  = 'data/s1'
-    ALIGN_DIR  = 'data/alignments/s1'
-    BATCH_SIZE = 15
-    NUM_EPOCHS = 20
-    LR         = 1e-3
+    CORPUS_ROOT = '/Data/grid_corpus'
+    BATCH_SIZE = 16
+    NUM_EPOCHS = 150 
+    LR         = 1e-3  # Slightly higher for faster initial learning
 
     print(f"Device: {DEVICE}")
 
     # ---- Dataset ----
     print("Loading dataset (suppressing MediaPipe warnings)...")
     with suppress_stderr():
-        dataset = LipReadingDataset(VIDEO_DIR, ALIGN_DIR)
+        dataset = LipReadingDataset(corpus_root=CORPUS_ROOT, use_cache=True)
     print(f"✓ Dataset loaded")
 
     total   = len(dataset)
-    train_n = max(1, int(0.9 * total))
+    train_n = int(0.7 * total)
     test_n  = total - train_n
     train_set, test_set = random_split(
         dataset, [train_n, test_n],
-        generator=torch.Generator().manual_seed(4),
+        generator=torch.Generator().manual_seed(67),
     )
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_fn)
     test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
@@ -350,7 +342,7 @@ if __name__ == "__main__":
     print(f"Model parameters: {total_params:,}")
 
     # ---- Load checkpoint if it exists ----
-    checkpoint_path = "lipreading_final.pth"
+    checkpoint_path = "lipreading_best.pth"
     if os.path.exists(checkpoint_path):
         print(f"\n✓ Found checkpoint file: {checkpoint_path}")
         try:
@@ -369,17 +361,23 @@ if __name__ == "__main__":
         print(f"\n✗ No checkpoint found. Training from scratch.\n")
 
     optimizer        = optim.Adam(model.parameters(), lr=LR)
+    scheduler        = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
+    )
     criterion_ctc    = nn.CTCLoss(blank=0, zero_infinity=True)
-    criterion_timing = nn.CrossEntropyLoss()
 
     # ---- Training ----
     print("\n" + "=" * 60)
     print(f"TRAINING  ({NUM_EPOCHS} epochs)")
     print("=" * 60)
 
+    best_val_loss = float('inf')
+    patience_counter = 0
+    
     for epoch in range(1, NUM_EPOCHS + 1):
         model.train()
-        epoch_loss = epoch_text_loss = epoch_timing_loss = 0.0
+        epoch_loss = 0.0
+        epoch_grad_norm = 0.0
         num_batches = len(train_loader)
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}",
@@ -389,37 +387,83 @@ if __name__ == "__main__":
             batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
 
-            loss, tloss, timing_loss = train_step(
-                model, batch, criterion_ctc, criterion_timing, optimizer
-            )
-            epoch_loss        += loss
-            epoch_text_loss   += tloss
-            epoch_timing_loss += timing_loss
+            try:
+                loss, grad_norm = train_step(
+                    model, batch, criterion_ctc, optimizer, epoch
+                )
+            except Exception as e:
+                tqdm.write(f"  [SKIP] Batch {batch_idx} error: {e}")
+                continue
+
+            epoch_loss      += loss
+            epoch_grad_norm += grad_norm
 
             pbar.set_postfix({
-                'total': f'{loss:.4f}',
-                'text': f'{tloss:.4f}',
-                'timing': f'{timing_loss:.4f}',
+                'loss': f'{loss:.4f}',
+                'grad': f'{grad_norm:.3f}',
             })
 
-        avg        = epoch_loss        / num_batches
-        avg_text   = epoch_text_loss   / num_batches
-        avg_timing = epoch_timing_loss / num_batches
+        avg_loss = epoch_loss     / max(num_batches, 1)
+        avg_grad = epoch_grad_norm / max(num_batches, 1)
 
         tqdm.write(f"\n{'=' * 60}")
         tqdm.write(f"Epoch {epoch}/{NUM_EPOCHS} Summary:")
-        tqdm.write(f"  Avg Total Loss  : {avg:.4f}")
-        tqdm.write(f"  Avg Text Loss   : {avg_text:.4f}")
-        tqdm.write(f"  Avg Timing Loss : {avg_timing:.4f}")
+        tqdm.write(f"  Avg Loss        : {avg_loss:.4f}")
+        tqdm.write(f"  Avg Grad Norm   : {avg_grad:.4f}")
+
+        # Validation loss
+        model.eval()
+        val_loss = 0.0
+        val_batches = 0
+        with torch.no_grad():
+            for val_batch in test_loader:
+                val_batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
+                            for k, v in val_batch.items()}
+                try:
+                    v_text_logits = model(val_batch['mouth_frames'])
+                    
+                    v_log_probs = nn.functional.log_softmax(v_text_logits, dim=2).transpose(0, 1)
+                    v_loss = criterion_ctc(
+                        v_log_probs, val_batch['char_indices'], 
+                        val_batch['mouth_lengths'], val_batch['text_lengths']
+                    ).item()
+                    
+                    val_loss += v_loss
+                    val_batches += 1
+                except Exception:
+                    continue
+        
+        val_loss /= max(val_batches, 1)
+        
+        tqdm.write(f"  Val Loss        : {val_loss:.4f}")
+        
+        # Learning rate scheduling
+        scheduler.step(val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        tqdm.write(f"  Learning Rate   : {current_lr:.6f}")
+        
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            # Save best model
+            torch.save(model.state_dict(), "lipreading_best.pth")
+            tqdm.write(f"  ✓ New best model saved!")
+        else:
+            patience_counter += 1
+            if patience_counter >= 10:
+                tqdm.write(f"\n  Early stopping triggered (no improvement for 10 epochs)")
+                tqdm.write(f"  Best validation loss: {best_val_loss:.4f}")
+                break
 
         # Quick training sample check
-        if epoch % 2 == 0:
+        if epoch % 5 == 0:
             model.eval()
             with torch.no_grad():
                 sample_batch = next(iter(train_loader))
                 sample_batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
                                 for k, v in sample_batch.items()}
-                logits, timing_logits = model(sample_batch['mouth_frames'])
+                logits = model(sample_batch['mouth_frames'])
 
                 # Text sample
                 decoded = ctc_greedy_decode(logits, blank_id=0)
@@ -429,26 +473,29 @@ if __name__ == "__main__":
                     num_to_char,
                 )
 
-                # Timing accuracy
-                timing_preds = torch.argmax(timing_logits, dim=-1)
-                timing_gt = sample_batch['frame_word_labels']
-                n_frames = sample_batch['mouth_lengths'][0].item()
-                n_correct = (timing_preds[0, :n_frames] == timing_gt[0, :n_frames]).sum().item()
+                # Word accuracy on sample
+                word_acc, exact_match = compute_word_accuracy(pred_text, gt_text)
 
                 tqdm.write(f"  [Sample] GT: '{gt_text[:40]}' | Pred: '{pred_text[:40]}'")
-                tqdm.write(f"  [Sample] Timing accuracy: {n_correct}/{n_frames} "
-                           f"({100 * n_correct / max(n_frames, 1):.1f}%)")
+                tqdm.write(f"  [Sample] Word accuracy: {100 * word_acc:.1f}%")
             model.train()
         tqdm.write(f"{'=' * 60}\n")
 
-        # Save checkpoint on last epoch
-        if epoch == NUM_EPOCHS:
-            ckpt = "lipreading_final.pth"
+        # Save periodic checkpoint
+        if epoch % 10 == 0 or epoch == NUM_EPOCHS:
+            ckpt = f"lipreading_epoch_{epoch}.pth"
             try:
                 torch.save(model.state_dict(), ckpt)
-                print(f"   Final checkpoint saved → {ckpt}")
+                tqdm.write(f"  Checkpoint saved → {ckpt}")
             except Exception as e:
-                print(f"   Warning: Could not save checkpoint: {e}")
+                tqdm.write(f"  Warning: Could not save checkpoint: {e}")
+    
+    # Load best model for inference
+    print(f"\nLoading best model for inference...")
+    if os.path.exists("lipreading_best.pth"):
+        model.load_state_dict(torch.load("lipreading_best.pth", map_location=DEVICE))
+        print(f"✓ Loaded best model (val loss: {best_val_loss:.4f})")
 
     # ---- Inference examples ----
     run_inference_examples(model, test_loader, DEVICE, num_examples=3)
+    # run_single_test_video(model, "data/testons.mpg", DEVICE)

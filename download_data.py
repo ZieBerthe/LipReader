@@ -21,3 +21,4 @@ if __name__ == "__main__":
     url = "https://drive.google.com/uc?id=1YlvpDLix3S-U8fd-gqRwPcWXAXm8JwjL"
     output_path = "data.zip"
     download_data(url, output_path)
+# we can download more data online, this is a popular dataset for lip reading named GRID corpus.

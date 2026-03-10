@@ -287,6 +287,7 @@ if __name__ == "__main__":
         video_path='data/s1/bbaf2n.mpg',
         alignment_path='data/alignments/s1/bbaf2n.align',
     )
+    
 
     print(f'\nMouth frames shape: {mouth_frames.shape}')
     print(f'Character indices length: {len(char_indices)}')
@@ -296,3 +297,6 @@ if __name__ == "__main__":
     print(f'\nWord timings:')
     for word, start, end in word_timings:
         print(f'  {word}: {start:.3f}s - {end:.3f}s (duration: {end-start:.3f}s)')
+    #printing the word embedding vector for the video_path = 'data/s1/bbaf2n.mpg'
+    print(f'\nWord embedding vector for video_path = "data/s1/bbaf2n.mpg":')
+    print(f'  {char_indices}')
