@@ -47,6 +47,9 @@ DEC_HIDDEN   = 512
 POSTNET_CH   = 256
 POSTNET_LAYERS = 3
 
+# Training hyper-parameters
+INITIAL_LR   = 1e-6
+
 # ---------------------------------------------------------------------------
 #  Dataset
 # ---------------------------------------------------------------------------
@@ -418,10 +421,9 @@ def validate(model, loader, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train TTS with video style embedding")
-    parser.add_argument("--manifest", default=os.path.join(ROOT, "tts", "prepped", "manifest.jsonl"))
+    parser.add_argument("--manifest", default="/Data/tts_prepped/manifest.jsonl")
     parser.add_argument("--epochs",   type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr",       type=float, default=1e-3)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--ckpt_dir", default=os.path.join(ROOT, "tts", "checkpoints"))
     parser.add_argument("--resume",   default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
@@ -462,7 +464,7 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.Adam(model.parameters(), lr=INITIAL_LR)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
 
     start_epoch = 1
@@ -470,15 +472,21 @@ def main():
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = INITIAL_LR
         start_epoch = ckpt.get("epoch", 0) + 1
+
         print(f"Resumed from {args.resume} (epoch {start_epoch - 1})")
 
     # ---- Training loop ----
     print(f"\n{'=' * 60}")
-    print(f"TRAINING  ({args.epochs} epochs, batch={args.batch_size}, lr={args.lr})")
+    print(f"TRAINING  ({args.epochs} epochs, batch={args.batch_size}, lr={INITIAL_LR})")
     print(f"{'=' * 60}\n")
 
-    best_val = float("inf")
+    if not (args.resume and os.path.isfile(args.resume)):
+        best_val = float("inf")
+    else :
+        best_val = ckpt.get("val_loss", float("inf"))
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch, args.epochs)
@@ -501,15 +509,15 @@ def main():
             ), best_path)
             tqdm.write(f"  ✓ Best model saved → {best_path}  (val {val_loss:.4f})")
 
-        # Periodic checkpoint
-        if epoch % 10 == 0 or epoch == args.epochs:
-            path = os.path.join(args.ckpt_dir, f"tts_epoch_{epoch}.pth")
-            torch.save(dict(
-                epoch=epoch, model=model.state_dict(),
-                optimizer=optimizer.state_dict(), val_loss=val_loss,
-                mel_config=mel_cfg,
-            ), path)
-            tqdm.write(f"  Checkpoint → {path}")
+#        # Periodic checkpoint
+        # if epoch % 10 == 0 or epoch == args.epochs:
+        #     path = os.path.join(args.ckpt_dir, f"tts_epoch_{epoch}.pth")
+        #     torch.save(dict(
+        #         epoch=epoch, model=model.state_dict(),
+        #         optimizer=optimizer.state_dict(), val_loss=val_loss,
+        #         mel_config=mel_cfg,
+        #     ), path)
+        #     tqdm.write(f"  Checkpoint → {path}")
 
     print(f"\nTraining complete.  Best val loss: {best_val:.4f}")
 

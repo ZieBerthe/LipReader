@@ -366,135 +366,135 @@ if __name__ == "__main__":
     )
     criterion_ctc    = nn.CTCLoss(blank=0, zero_infinity=True)
 
-    # ---- Training ----
-    print("\n" + "=" * 60)
-    print(f"TRAINING  ({NUM_EPOCHS} epochs)")
-    print("=" * 60)
+    # # ---- Training ----
+    # print("\n" + "=" * 60)
+    # print(f"TRAINING  ({NUM_EPOCHS} epochs)")
+    # print("=" * 60)
 
-    best_val_loss = float('inf')
-    patience_counter = 0
+    # best_val_loss = float('inf')
+    # patience_counter = 0
     
-    for epoch in range(1, NUM_EPOCHS + 1):
-        model.train()
-        epoch_loss = 0.0
-        epoch_grad_norm = 0.0
-        num_batches = len(train_loader)
+    # for epoch in range(1, NUM_EPOCHS + 1):
+    #     model.train()
+    #     epoch_loss = 0.0
+    #     epoch_grad_norm = 0.0
+    #     num_batches = len(train_loader)
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}",
-                    ncols=120, leave=True)
+    #     pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}",
+    #                 ncols=120, leave=True)
 
-        for batch_idx, batch in enumerate(pbar, 1):
-            batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
+    #     for batch_idx, batch in enumerate(pbar, 1):
+    #         batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
+    #                  for k, v in batch.items()}
 
-            try:
-                loss, grad_norm = train_step(
-                    model, batch, criterion_ctc, optimizer, epoch
-                )
-            except Exception as e:
-                tqdm.write(f"  [SKIP] Batch {batch_idx} error: {e}")
-                continue
+    #         try:
+    #             loss, grad_norm = train_step(
+    #                 model, batch, criterion_ctc, optimizer, epoch
+    #             )
+    #         except Exception as e:
+    #             tqdm.write(f"  [SKIP] Batch {batch_idx} error: {e}")
+    #             continue
 
-            epoch_loss      += loss
-            epoch_grad_norm += grad_norm
+    #         epoch_loss      += loss
+    #         epoch_grad_norm += grad_norm
 
-            pbar.set_postfix({
-                'loss': f'{loss:.4f}',
-                'grad': f'{grad_norm:.3f}',
-            })
+    #         pbar.set_postfix({
+    #             'loss': f'{loss:.4f}',
+    #             'grad': f'{grad_norm:.3f}',
+    #         })
 
-        avg_loss = epoch_loss     / max(num_batches, 1)
-        avg_grad = epoch_grad_norm / max(num_batches, 1)
+    #     avg_loss = epoch_loss     / max(num_batches, 1)
+    #     avg_grad = epoch_grad_norm / max(num_batches, 1)
 
-        tqdm.write(f"\n{'=' * 60}")
-        tqdm.write(f"Epoch {epoch}/{NUM_EPOCHS} Summary:")
-        tqdm.write(f"  Avg Loss        : {avg_loss:.4f}")
-        tqdm.write(f"  Avg Grad Norm   : {avg_grad:.4f}")
+    #     tqdm.write(f"\n{'=' * 60}")
+    #     tqdm.write(f"Epoch {epoch}/{NUM_EPOCHS} Summary:")
+    #     tqdm.write(f"  Avg Loss        : {avg_loss:.4f}")
+    #     tqdm.write(f"  Avg Grad Norm   : {avg_grad:.4f}")
 
-        # Validation loss
-        model.eval()
-        val_loss = 0.0
-        val_batches = 0
-        with torch.no_grad():
-            for val_batch in test_loader:
-                val_batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
-                            for k, v in val_batch.items()}
-                try:
-                    v_text_logits = model(val_batch['mouth_frames'])
+    #     # Validation loss
+    #     model.eval()
+    #     val_loss = 0.0
+    #     val_batches = 0
+    #     with torch.no_grad():
+    #         for val_batch in test_loader:
+    #             val_batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
+    #                         for k, v in val_batch.items()}
+    #             try:
+    #                 v_text_logits = model(val_batch['mouth_frames'])
                     
-                    v_log_probs = nn.functional.log_softmax(v_text_logits, dim=2).transpose(0, 1)
-                    v_loss = criterion_ctc(
-                        v_log_probs, val_batch['char_indices'], 
-                        val_batch['mouth_lengths'], val_batch['text_lengths']
-                    ).item()
+    #                 v_log_probs = nn.functional.log_softmax(v_text_logits, dim=2).transpose(0, 1)
+    #                 v_loss = criterion_ctc(
+    #                     v_log_probs, val_batch['char_indices'], 
+    #                     val_batch['mouth_lengths'], val_batch['text_lengths']
+    #                 ).item()
                     
-                    val_loss += v_loss
-                    val_batches += 1
-                except Exception:
-                    continue
+    #                 val_loss += v_loss
+    #                 val_batches += 1
+    #             except Exception:
+    #                 continue
         
-        val_loss /= max(val_batches, 1)
+    #     val_loss /= max(val_batches, 1)
         
-        tqdm.write(f"  Val Loss        : {val_loss:.4f}")
+    #     tqdm.write(f"  Val Loss        : {val_loss:.4f}")
         
-        # Learning rate scheduling
-        scheduler.step(val_loss)
-        current_lr = optimizer.param_groups[0]['lr']
-        tqdm.write(f"  Learning Rate   : {current_lr:.6f}")
+    #     # Learning rate scheduling
+    #     scheduler.step(val_loss)
+    #     current_lr = optimizer.param_groups[0]['lr']
+    #     tqdm.write(f"  Learning Rate   : {current_lr:.6f}")
         
-        # Early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            # Save best model
-            torch.save(model.state_dict(), "lipreading_best.pth")
-            tqdm.write(f"  ✓ New best model saved!")
-        else:
-            patience_counter += 1
-            if patience_counter >= 10:
-                tqdm.write(f"\n  Early stopping triggered (no improvement for 10 epochs)")
-                tqdm.write(f"  Best validation loss: {best_val_loss:.4f}")
-                break
+    #     # Early stopping
+    #     if val_loss < best_val_loss:
+    #         best_val_loss = val_loss
+    #         patience_counter = 0
+    #         # Save best model
+    #         torch.save(model.state_dict(), "lipreading_best.pth")
+    #         tqdm.write(f"  ✓ New best model saved!")
+    #     else:
+    #         patience_counter += 1
+    #         if patience_counter >= 10:
+    #             tqdm.write(f"\n  Early stopping triggered (no improvement for 10 epochs)")
+    #             tqdm.write(f"  Best validation loss: {best_val_loss:.4f}")
+    #             break
 
-        # Quick training sample check
-        if epoch % 5 == 0:
-            model.eval()
-            with torch.no_grad():
-                sample_batch = next(iter(train_loader))
-                sample_batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
-                                for k, v in sample_batch.items()}
-                logits = model(sample_batch['mouth_frames'])
+    #     # Quick training sample check
+    #     if epoch % 5 == 0:
+    #         model.eval()
+    #         with torch.no_grad():
+    #             sample_batch = next(iter(train_loader))
+    #             sample_batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
+    #                             for k, v in sample_batch.items()}
+    #             logits = model(sample_batch['mouth_frames'])
 
-                # Text sample
-                decoded = ctc_greedy_decode(logits, blank_id=0)
-                pred_text = ids_to_text(decoded[0][:30], num_to_char)
-                gt_text = ids_to_text(
-                    sample_batch['char_indices'][0][:sample_batch['text_lengths'][0]].cpu().tolist(),
-                    num_to_char,
-                )
+    #             # Text sample
+    #             decoded = ctc_greedy_decode(logits, blank_id=0)
+    #             pred_text = ids_to_text(decoded[0][:30], num_to_char)
+    #             gt_text = ids_to_text(
+    #                 sample_batch['char_indices'][0][:sample_batch['text_lengths'][0]].cpu().tolist(),
+    #                 num_to_char,
+    #             )
 
-                # Word accuracy on sample
-                word_acc, exact_match = compute_word_accuracy(pred_text, gt_text)
+    #             # Word accuracy on sample
+    #             word_acc, exact_match = compute_word_accuracy(pred_text, gt_text)
 
-                tqdm.write(f"  [Sample] GT: '{gt_text[:40]}' | Pred: '{pred_text[:40]}'")
-                tqdm.write(f"  [Sample] Word accuracy: {100 * word_acc:.1f}%")
-            model.train()
-        tqdm.write(f"{'=' * 60}\n")
+    #             tqdm.write(f"  [Sample] GT: '{gt_text[:40]}' | Pred: '{pred_text[:40]}'")
+    #             tqdm.write(f"  [Sample] Word accuracy: {100 * word_acc:.1f}%")
+    #         model.train()
+    #     tqdm.write(f"{'=' * 60}\n")
 
-        # Save periodic checkpoint
-        if epoch % 10 == 0 or epoch == NUM_EPOCHS:
-            ckpt = f"lipreading_epoch_{epoch}.pth"
-            try:
-                torch.save(model.state_dict(), ckpt)
-                tqdm.write(f"  Checkpoint saved → {ckpt}")
-            except Exception as e:
-                tqdm.write(f"  Warning: Could not save checkpoint: {e}")
+    #     # Save periodic checkpoint
+    #     if epoch % 10 == 0 or epoch == NUM_EPOCHS:
+    #         ckpt = f"lipreading_epoch_{epoch}.pth"
+    #         try:
+    #             torch.save(model.state_dict(), ckpt)
+    #             tqdm.write(f"  Checkpoint saved → {ckpt}")
+    #         except Exception as e:
+    #             tqdm.write(f"  Warning: Could not save checkpoint: {e}")
     
-    # Load best model for inference
-    print(f"\nLoading best model for inference...")
-    if os.path.exists("lipreading_best.pth"):
-        model.load_state_dict(torch.load("lipreading_best.pth", map_location=DEVICE))
-        print(f"✓ Loaded best model (val loss: {best_val_loss:.4f})")
+    # # Load best model for inference
+    # print(f"\nLoading best model for inference...")
+    # if os.path.exists("lipreading_best.pth"):
+    #     model.load_state_dict(torch.load("lipreading_best.pth", map_location=DEVICE))
+    #     print(f"✓ Loaded best model (val loss: {best_val_loss:.4f})")
 
     # ---- Inference examples ----
     run_inference_examples(model, test_loader, DEVICE, num_examples=3)

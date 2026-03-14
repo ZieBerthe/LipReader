@@ -63,7 +63,7 @@ def lip_read_text(video_frames: torch.Tensor, device: torch.device) -> str:
     num_chars = len(char_to_num) + 1  # +1 for CTC blank (index 0)
     lr_model = LipReadingModel(num_chars=num_chars).to(device)
 
-    ckpt_path = os.path.join(ROOT, "lipreading_final.pth")
+    ckpt_path = os.path.join(ROOT, "lipreading_best.pth")
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
             f"Lip-reading checkpoint not found at {ckpt_path}.  "
@@ -83,7 +83,8 @@ def lip_read_text(video_frames: torch.Tensor, device: torch.device) -> str:
 
     x = video_frames.unsqueeze(0).to(device)               # (1, T, H, W)
     with torch.no_grad():
-        text_logits, _ = lr_model(x)
+        # text_logits, _ = lr_model(x)
+        text_logits = lr_model(x)                          # (1, L, num_chars)
     decoded = ctc_greedy_decode(text_logits, blank_id=0)
     text = ids_to_text(decoded[0], num_to_char)
     return text
@@ -129,9 +130,11 @@ def main():
     parser.add_argument("--frames",  default=None, help="Path to pre-extracted frames .npy")
     parser.add_argument("--ckpt",    default=os.path.join(ROOT, "tts", "checkpoints", "tts_best.pth"),
                         help="TTS model checkpoint")
-    parser.add_argument("--out",     default=os.path.join(ROOT, "tts", "output.wav"),
-                        help="Output wav path")
     parser.add_argument("--gl_iter", type=int, default=60, help="Griffin-Lim iterations")
+    args = parser.parse_args()
+    video_name = os.path.splitext(os.path.basename(args.video))[0] if args.video else "output"
+    parser.add_argument("--out",     default=os.path.join(ROOT, "tts", f"output{video_name}.wav"),
+                        help="Output wav path")
     args = parser.parse_args()
 
     if args.video is None and args.frames is None:
@@ -146,7 +149,7 @@ def main():
         print("Train the TTS model first:  python tts/train_tts_video_style.py")
         sys.exit(1)
 
-    ckpt = torch.load(args.ckpt, map_location=device)
+    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     mel_cfg = ckpt["mel_config"]
     n_mels  = mel_cfg["n_mels"]
     print(f"Mel config: {mel_cfg}")

@@ -11,3 +11,4 @@ data/
 *.pt
 !.pixi/config.toml
 *.wav
+prepped/
