@@ -37,8 +37,6 @@ with open(os.devnull, 'w') as _devnull:
 os.dup2(_old_stderr, _stderr_fd)
 os.close(_old_stderr)
 
-torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
 # MediaPipe for face mesh and landmark detection
 model_path = "models/face_landmarker.task"
 BaseOptions = mp.tasks.BaseOptions

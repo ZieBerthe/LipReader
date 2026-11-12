@@ -2,7 +2,8 @@
 data/
 *.zip
 *.align
-*.mpg# pixi environments
+*.mpg
+# pixi environments
 .pixi/*
 !.pixi/config.toml
 # pixi environments
@@ -12,3 +13,5 @@ data/
 !.pixi/config.toml
 *.wav
 prepped/
+__pycache__/
+logs/

@@ -6,10 +6,10 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from matplotlib import pyplot as plt
 import imageio
 from load_data import load_data, decode_indices, encode_chars, char_to_num, num_to_char
+from paths import DATA_ROOT, CACHE_ROOT, find_samples
 
 
-# ---- Data root (absolute path – do NOT auto-detect) ----
-GRID_CORPUS_ROOT = '/Data/grid_corpus'
+GRID_CORPUS_ROOT = DATA_ROOT
 
 
 # Custom Dataset for LipReading (text + word timing prediction)
@@ -17,10 +17,9 @@ class LipReadingDataset(Dataset):
     def __init__(self, corpus_root=GRID_CORPUS_ROOT, cache_root=None, use_cache=True):
         """
         Args:
-            corpus_root: Root directory containing s*_processed/ speaker folders.
-                         Each folder has .mpg files and an align/ subfolder with .align files.
+            corpus_root: GRID root with speaker folders (see paths.find_samples for layouts).
             cache_root:  Root directory for cached preprocessed data.
-                         Defaults to <corpus_root>/../grid_corpus_cache
+                         Defaults to paths.CACHE_ROOT (<data>/cache)
             use_cache:   Whether to use cached data (much faster!)
         """
         self.corpus_root = corpus_root
@@ -29,25 +28,16 @@ class LipReadingDataset(Dataset):
         self.cache_paths = []
 
         if cache_root is None:
-            cache_root = os.path.join(os.path.dirname(corpus_root), 'grid_corpus_cache')
+            cache_root = CACHE_ROOT
         self.cache_root = cache_root
 
-        # Discover all speaker folders
-        speaker_dirs = sorted(glob.glob(os.path.join(corpus_root, 's*_processed')))
-        if not speaker_dirs:
-            raise FileNotFoundError(f"No s*_processed folders found in {corpus_root}")
-
-        for speaker_dir in speaker_dirs:
-            speaker_name = os.path.basename(speaker_dir)  # e.g. s1_processed
-            align_dir = os.path.join(speaker_dir, 'align')
-            cache_dir = os.path.join(cache_root, speaker_name)
-
-            videos = sorted(glob.glob(os.path.join(speaker_dir, '*.mpg')))
-            for v in videos:
-                vname = os.path.splitext(os.path.basename(v))[0]
-                self.video_paths.append(v)
-                self.align_paths.append(os.path.join(align_dir, f"{vname}.align"))
-                self.cache_paths.append(os.path.join(cache_dir, f"{vname}.pt"))
+        samples = find_samples(corpus_root)
+        for speaker_name, v, align_path in samples:
+            vname = os.path.splitext(os.path.basename(v))[0]
+            self.video_paths.append(v)
+            self.align_paths.append(align_path)
+            self.cache_paths.append(os.path.join(cache_root, speaker_name, f"{vname}.pt"))
+        num_speakers = len({s for s, _, _ in samples})
 
         self.use_cache = use_cache
 
@@ -59,7 +49,7 @@ class LipReadingDataset(Dataset):
             else:
                 print(f"✓ All {cached_count} videos cached.")
 
-        print(f"Dataset: {len(self.video_paths)} videos from {len(speaker_dirs)} speakers")
+        print(f"Dataset: {len(self.video_paths)} videos from {num_speakers} speakers")
 
     def __len__(self):
         return len(self.video_paths)

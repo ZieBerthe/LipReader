@@ -30,6 +30,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
+from device import get_device
+from paths import TTS_PREP_ROOT
 from load_data import char_to_num, num_to_char, vocab, encode_chars, VIDEO_FPS
 
 # ---------------------------------------------------------------------------
@@ -421,7 +423,7 @@ def validate(model, loader, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train TTS with video style embedding")
-    parser.add_argument("--manifest", default="/Data/tts_prepped/manifest.jsonl")
+    parser.add_argument("--manifest", default=os.path.join(TTS_PREP_ROOT, "manifest.jsonl"))
     parser.add_argument("--epochs",   type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--ckpt_dir", default=os.path.join(ROOT, "tts", "checkpoints"))
@@ -434,7 +436,7 @@ def main():
         sys.exit(1)
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     print(f"Device: {device}")
 
     # ---- Load mel config (n_mels) ----

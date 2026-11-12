@@ -28,6 +28,8 @@ import torch
 import librosa
 import soundfile as sf
 
+from device import get_device
+from paths import LIPREADING_CKPT
 from load_data import (
     load_video, char_to_num, num_to_char, vocab,
     encode_chars, VIDEO_FPS,
@@ -63,7 +65,7 @@ def lip_read_text(video_frames: torch.Tensor, device: torch.device) -> str:
     num_chars = len(char_to_num) + 1  # +1 for CTC blank (index 0)
     lr_model = LipReadingModel(num_chars=num_chars).to(device)
 
-    ckpt_path = os.path.join(ROOT, "lipreading_best.pth")
+    ckpt_path = LIPREADING_CKPT
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
             f"Lip-reading checkpoint not found at {ckpt_path}.  "
@@ -140,7 +142,7 @@ def main():
     if args.video is None and args.frames is None:
         parser.error("Provide at least one of --video or --frames")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     print(f"Device: {device}")
 
     # ---- Load checkpoint & mel config ----

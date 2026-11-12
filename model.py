@@ -39,6 +39,23 @@ from load_data import load_video, decode_indices, encode_chars, char_to_num, num
 from data_pipeline import LipReadingDataset, collate_fn, MAX_MOUTH_FRAMES, MAX_TEXT_LENGTH, MAX_WORDS
 import torch.nn as nn
 import torch.optim as optim
+from device import get_device
+from paths import DATA_ROOT, PROJECT_ROOT, LIPREADING_CKPT
+
+
+def adaptive_avg_pool_2x2(x):
+    """Same result as nn.AdaptiveAvgPool3d((None, 2, 2)) on (B, C, T, H, W).
+
+    Written with slicing because MPS supports neither AdaptiveAvgPool3d nor
+    adaptive pooling with non-divisible sizes (here W=25 → 2).
+    Bins follow PyTorch's rule: [floor(i*n/2), ceil((i+1)*n/2)).
+    """
+    H, W = x.shape[-2:]
+    hb = [(0, (H + 1) // 2), (H // 2, H)]
+    wb = [(0, (W + 1) // 2), (W // 2, W)]
+    rows = [torch.stack([x[..., h0:h1, w0:w1].mean(dim=(-2, -1)) for w0, w1 in wb], dim=-1)
+            for h0, h1 in hb]
+    return torch.stack(rows, dim=-2)
 
 
 class LipReadingModel(nn.Module):
@@ -67,8 +84,8 @@ class LipReadingModel(nn.Module):
             nn.ReLU(),
             nn.MaxPool3d(kernel_size=(1, 2, 2)),  # (B, 96, T, 12, 25)
         )
-        # Collapse spatial dims: (B, 96, T, 12, 25) → (B, 96, T, 2, 2)
-        self.spatial_pool = nn.AdaptiveAvgPool3d((None, 2, 2))
+        # Collapse spatial dims per frame: (12, 25) → (2, 2) — see adaptive_avg_pool_2x2
+        self.spatial_pool = adaptive_avg_pool_2x2
         self.feature_size = 96 * 2 * 2  # = 384
 
         # 2-layer BiLSTM
@@ -88,10 +105,9 @@ class LipReadingModel(nn.Module):
         x = x.unsqueeze(1)  # (B, 1, T, H, W)
 
         features = self.cnn(x)  # (B, 96, T, 12, 25)
+        T_out = features.size(2)
         features = self.spatial_pool(features)                          # (B, 96, T, 2, 2)
-        _, C, T_out, H_new, W_new = features.size()
-        features = features.permute(0, 2, 1, 3, 4)                     # (B, T, C, H', W')
-        features = features.contiguous().view(B, T_out, -1)             # (B, T, 384)
+        features = features.permute(0, 2, 1, 3, 4).reshape(B, T_out, -1)  # (B, T, 384)
 
         lstm_out, _ = self.bilstm(features)   # (B, T, 256)
         lstm_out = self.dropout(lstm_out)
@@ -115,8 +131,10 @@ def train_step(model, batch, criterion_ctc, optimizer, epoch=1):
     text_logits = model(mouth_frames)
 
     # ---- CTC loss for text ----
+    # CTC isn't implemented on MPS, so the loss runs on CPU; gradients still
+    # flow back to the model on the GPU (the loss itself is cheap).
     log_probs = nn.functional.log_softmax(text_logits, dim=2).transpose(0, 1)
-    loss = criterion_ctc(log_probs, text_targets, mouth_lengths, text_lengths)
+    loss = criterion_ctc(log_probs.cpu(), text_targets.cpu(), mouth_lengths.cpu(), text_lengths.cpu())
 
     optimizer.zero_grad()
     loss.backward()
@@ -292,22 +310,16 @@ if __name__ == "__main__":
     import warnings
     warnings.filterwarnings('ignore')
 
-    # ---- GPU Memory Management ----
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-        print("✓ GPU cache cleared")
-
     # ---- Config ----
-    print(f'CUDA available: {torch.cuda.is_available()}')
+    DEVICE     = get_device()
     print(f"PyTorch version: {torch.__version__}")
-    if torch.cuda.is_available():
-        print(f"CUDA version: {torch.version.cuda}")
-
-    DEVICE     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    CORPUS_ROOT = '/Data/grid_corpus'
-    BATCH_SIZE = 16
+    if DEVICE.type == 'mps':
+        torch.mps.empty_cache()
+    elif DEVICE.type == 'cuda':
+        torch.cuda.empty_cache()
+    CORPUS_ROOT = DATA_ROOT
+    # 16 GB unified memory on the Mac: batch 8 already swaps (~15x slower per sample)
+    BATCH_SIZE = 4 if DEVICE.type == 'mps' else 16
     NUM_EPOCHS = 150 
     LR         = 1e-3  # Slightly higher for faster initial learning
 
@@ -342,7 +354,7 @@ if __name__ == "__main__":
     print(f"Model parameters: {total_params:,}")
 
     # ---- Load checkpoint if it exists ----
-    checkpoint_path = "lipreading_best.pth"
+    checkpoint_path = LIPREADING_CKPT
     if os.path.exists(checkpoint_path):
         print(f"\n✓ Found checkpoint file: {checkpoint_path}")
         try:
@@ -366,136 +378,136 @@ if __name__ == "__main__":
     )
     criterion_ctc    = nn.CTCLoss(blank=0, zero_infinity=True)
 
-    # # ---- Training ----
-    # print("\n" + "=" * 60)
-    # print(f"TRAINING  ({NUM_EPOCHS} epochs)")
-    # print("=" * 60)
+    # ---- Training ----
+    print("\n" + "=" * 60)
+    print(f"TRAINING  ({NUM_EPOCHS} epochs)")
+    print("=" * 60)
 
-    # best_val_loss = float('inf')
-    # patience_counter = 0
-    
-    # for epoch in range(1, NUM_EPOCHS + 1):
-    #     model.train()
-    #     epoch_loss = 0.0
-    #     epoch_grad_norm = 0.0
-    #     num_batches = len(train_loader)
+    best_val_loss = float('inf')
+    patience_counter = 0
 
-    #     pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}",
-    #                 ncols=120, leave=True)
+    for epoch in range(1, NUM_EPOCHS + 1):
+        model.train()
+        epoch_loss = 0.0
+        epoch_grad_norm = 0.0
+        num_batches = len(train_loader)
 
-    #     for batch_idx, batch in enumerate(pbar, 1):
-    #         batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
-    #                  for k, v in batch.items()}
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}",
+                    ncols=120, leave=True)
 
-    #         try:
-    #             loss, grad_norm = train_step(
-    #                 model, batch, criterion_ctc, optimizer, epoch
-    #             )
-    #         except Exception as e:
-    #             tqdm.write(f"  [SKIP] Batch {batch_idx} error: {e}")
-    #             continue
+        for batch_idx, batch in enumerate(pbar, 1):
+            batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
+                     for k, v in batch.items()}
 
-    #         epoch_loss      += loss
-    #         epoch_grad_norm += grad_norm
+            try:
+                loss, grad_norm = train_step(
+                    model, batch, criterion_ctc, optimizer, epoch
+                )
+            except Exception as e:
+                tqdm.write(f"  [SKIP] Batch {batch_idx} error: {e}")
+                continue
 
-    #         pbar.set_postfix({
-    #             'loss': f'{loss:.4f}',
-    #             'grad': f'{grad_norm:.3f}',
-    #         })
+            epoch_loss      += loss
+            epoch_grad_norm += grad_norm
 
-    #     avg_loss = epoch_loss     / max(num_batches, 1)
-    #     avg_grad = epoch_grad_norm / max(num_batches, 1)
+            pbar.set_postfix({
+                'loss': f'{loss:.4f}',
+                'grad': f'{grad_norm:.3f}',
+            })
 
-    #     tqdm.write(f"\n{'=' * 60}")
-    #     tqdm.write(f"Epoch {epoch}/{NUM_EPOCHS} Summary:")
-    #     tqdm.write(f"  Avg Loss        : {avg_loss:.4f}")
-    #     tqdm.write(f"  Avg Grad Norm   : {avg_grad:.4f}")
+        avg_loss = epoch_loss     / max(num_batches, 1)
+        avg_grad = epoch_grad_norm / max(num_batches, 1)
 
-    #     # Validation loss
-    #     model.eval()
-    #     val_loss = 0.0
-    #     val_batches = 0
-    #     with torch.no_grad():
-    #         for val_batch in test_loader:
-    #             val_batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
-    #                         for k, v in val_batch.items()}
-    #             try:
-    #                 v_text_logits = model(val_batch['mouth_frames'])
-                    
-    #                 v_log_probs = nn.functional.log_softmax(v_text_logits, dim=2).transpose(0, 1)
-    #                 v_loss = criterion_ctc(
-    #                     v_log_probs, val_batch['char_indices'], 
-    #                     val_batch['mouth_lengths'], val_batch['text_lengths']
-    #                 ).item()
-                    
-    #                 val_loss += v_loss
-    #                 val_batches += 1
-    #             except Exception:
-    #                 continue
-        
-    #     val_loss /= max(val_batches, 1)
-        
-    #     tqdm.write(f"  Val Loss        : {val_loss:.4f}")
-        
-    #     # Learning rate scheduling
-    #     scheduler.step(val_loss)
-    #     current_lr = optimizer.param_groups[0]['lr']
-    #     tqdm.write(f"  Learning Rate   : {current_lr:.6f}")
-        
-    #     # Early stopping
-    #     if val_loss < best_val_loss:
-    #         best_val_loss = val_loss
-    #         patience_counter = 0
-    #         # Save best model
-    #         torch.save(model.state_dict(), "lipreading_best.pth")
-    #         tqdm.write(f"  ✓ New best model saved!")
-    #     else:
-    #         patience_counter += 1
-    #         if patience_counter >= 10:
-    #             tqdm.write(f"\n  Early stopping triggered (no improvement for 10 epochs)")
-    #             tqdm.write(f"  Best validation loss: {best_val_loss:.4f}")
-    #             break
+        tqdm.write(f"\n{'=' * 60}")
+        tqdm.write(f"Epoch {epoch}/{NUM_EPOCHS} Summary:")
+        tqdm.write(f"  Avg Loss        : {avg_loss:.4f}")
+        tqdm.write(f"  Avg Grad Norm   : {avg_grad:.4f}")
 
-    #     # Quick training sample check
-    #     if epoch % 5 == 0:
-    #         model.eval()
-    #         with torch.no_grad():
-    #             sample_batch = next(iter(train_loader))
-    #             sample_batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
-    #                             for k, v in sample_batch.items()}
-    #             logits = model(sample_batch['mouth_frames'])
+        # Validation loss
+        model.eval()
+        val_loss = 0.0
+        val_batches = 0
+        with torch.no_grad():
+            for val_batch in test_loader:
+                val_batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
+                            for k, v in val_batch.items()}
+                try:
+                    v_text_logits = model(val_batch['mouth_frames'])
 
-    #             # Text sample
-    #             decoded = ctc_greedy_decode(logits, blank_id=0)
-    #             pred_text = ids_to_text(decoded[0][:30], num_to_char)
-    #             gt_text = ids_to_text(
-    #                 sample_batch['char_indices'][0][:sample_batch['text_lengths'][0]].cpu().tolist(),
-    #                 num_to_char,
-    #             )
+                    v_log_probs = nn.functional.log_softmax(v_text_logits, dim=2).transpose(0, 1)
+                    v_loss = criterion_ctc(  # CPU: CTC isn't implemented on MPS
+                        v_log_probs.cpu(), val_batch['char_indices'].cpu(),
+                        val_batch['mouth_lengths'].cpu(), val_batch['text_lengths'].cpu()
+                    ).item()
 
-    #             # Word accuracy on sample
-    #             word_acc, exact_match = compute_word_accuracy(pred_text, gt_text)
+                    val_loss += v_loss
+                    val_batches += 1
+                except Exception:
+                    continue
 
-    #             tqdm.write(f"  [Sample] GT: '{gt_text[:40]}' | Pred: '{pred_text[:40]}'")
-    #             tqdm.write(f"  [Sample] Word accuracy: {100 * word_acc:.1f}%")
-    #         model.train()
-    #     tqdm.write(f"{'=' * 60}\n")
+        val_loss /= max(val_batches, 1)
 
-    #     # Save periodic checkpoint
-    #     if epoch % 10 == 0 or epoch == NUM_EPOCHS:
-    #         ckpt = f"lipreading_epoch_{epoch}.pth"
-    #         try:
-    #             torch.save(model.state_dict(), ckpt)
-    #             tqdm.write(f"  Checkpoint saved → {ckpt}")
-    #         except Exception as e:
-    #             tqdm.write(f"  Warning: Could not save checkpoint: {e}")
-    
-    # # Load best model for inference
-    # print(f"\nLoading best model for inference...")
-    # if os.path.exists("lipreading_best.pth"):
-    #     model.load_state_dict(torch.load("lipreading_best.pth", map_location=DEVICE))
-    #     print(f"✓ Loaded best model (val loss: {best_val_loss:.4f})")
+        tqdm.write(f"  Val Loss        : {val_loss:.4f}")
+
+        # Learning rate scheduling
+        scheduler.step(val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        tqdm.write(f"  Learning Rate   : {current_lr:.6f}")
+
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            # Save best model
+            torch.save(model.state_dict(), LIPREADING_CKPT)
+            tqdm.write(f"  ✓ New best model saved!")
+        else:
+            patience_counter += 1
+            if patience_counter >= 10:
+                tqdm.write(f"\n  Early stopping triggered (no improvement for 10 epochs)")
+                tqdm.write(f"  Best validation loss: {best_val_loss:.4f}")
+                break
+
+        # Quick training sample check
+        if epoch % 5 == 0:
+            model.eval()
+            with torch.no_grad():
+                sample_batch = next(iter(train_loader))
+                sample_batch = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
+                                for k, v in sample_batch.items()}
+                logits = model(sample_batch['mouth_frames'])
+
+                # Text sample
+                decoded = ctc_greedy_decode(logits, blank_id=0)
+                pred_text = ids_to_text(decoded[0][:30], num_to_char)
+                gt_text = ids_to_text(
+                    sample_batch['char_indices'][0][:sample_batch['text_lengths'][0]].cpu().tolist(),
+                    num_to_char,
+                )
+
+                # Word accuracy on sample
+                word_acc, exact_match = compute_word_accuracy(pred_text, gt_text)
+
+                tqdm.write(f"  [Sample] GT: '{gt_text[:40]}' | Pred: '{pred_text[:40]}'")
+                tqdm.write(f"  [Sample] Word accuracy: {100 * word_acc:.1f}%")
+            model.train()
+        tqdm.write(f"{'=' * 60}\n")
+
+        # Save periodic checkpoint
+        if epoch % 10 == 0 or epoch == NUM_EPOCHS:
+            ckpt = os.path.join(PROJECT_ROOT, f"lipreading_epoch_{epoch}.pth")
+            try:
+                torch.save(model.state_dict(), ckpt)
+                tqdm.write(f"  Checkpoint saved → {ckpt}")
+            except Exception as e:
+                tqdm.write(f"  Warning: Could not save checkpoint: {e}")
+
+    # Load best model for inference
+    print(f"\nLoading best model for inference...")
+    if os.path.exists(LIPREADING_CKPT):
+        model.load_state_dict(torch.load(LIPREADING_CKPT, map_location=DEVICE))
+        print(f"✓ Loaded best model (val loss: {best_val_loss:.4f})")
 
     # ---- Inference examples ----
     run_inference_examples(model, test_loader, DEVICE, num_examples=3)
-    # run_single_test_video(model, "data/testons.mpg", DEVICE)
+    # run_single_test_video(model, os.path.join(DATA_ROOT, "testons.mpg"), DEVICE)

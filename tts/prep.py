@@ -6,7 +6,7 @@ For each video in the GRID corpus:
   3. Parse alignment file → text string
 
 Outputs:
-    /Data/tts_prepped/
+    data/tts_prepped/            (paths.TTS_PREP_ROOT)
         manifest.jsonl          one JSON record per sample
         tts_mel_config.json     mel-spectrogram parameters
         <speaker>/<video_id>/
@@ -160,8 +160,10 @@ def _process_one(args_tuple):
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
-GRID_CORPUS_ROOT = '/Data/grid_corpus'
-DEFAULT_OUTPUT   = '/Data/tts_prepped'
+from paths import DATA_ROOT, TTS_PREP_ROOT, find_samples
+
+GRID_CORPUS_ROOT = DATA_ROOT
+DEFAULT_OUTPUT   = TTS_PREP_ROOT
 
 
 def main():
@@ -177,18 +179,11 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ---- Discover all speaker folders and collect (video, align, speaker) tuples ----
-    speaker_dirs = sorted(glob.glob(os.path.join(args.corpus_root, 's*_processed')))
-    if not speaker_dirs:
-        raise FileNotFoundError(f"No s*_processed folders in {args.corpus_root}")
+    samples = find_samples(args.corpus_root)
+    speaker_dirs = sorted({s for s, _, _ in samples})
 
-    work_items = []  # (video_path, align_path, output_dir, speaker_name)
-    for spk_dir in speaker_dirs:
-        speaker_name = os.path.basename(spk_dir)  # e.g. s1_processed
-        align_dir = os.path.join(spk_dir, 'align')
-        for v in sorted(glob.glob(os.path.join(spk_dir, '*.mpg'))):
-            vid_id = os.path.splitext(os.path.basename(v))[0]
-            align_path = os.path.join(align_dir, vid_id + '.align')
-            work_items.append((v, align_path, args.output_dir, speaker_name))
+    # (video_path, align_path, output_dir, speaker_name)
+    work_items = [(v, a, args.output_dir, s) for s, v, a in samples]
 
     if args.max_samples:
         work_items = work_items[: args.max_samples]

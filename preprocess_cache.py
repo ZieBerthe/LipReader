@@ -9,28 +9,28 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from load_data import load_data
+from paths import DATA_ROOT, CACHE_ROOT, find_samples
 
-GRID_CORPUS_ROOT = '/Data/grid_corpus'
-CACHE_ROOT = '/Data/grid_corpus_cache'
+GRID_CORPUS_ROOT = DATA_ROOT
 
 
 def preprocess_and_cache(corpus_root, cache_root):
     """Process all speaker videos and save mouth frames + alignment data to cache."""
 
-    speaker_dirs = sorted(glob.glob(os.path.join(corpus_root, 's*_processed')))
-    if not speaker_dirs:
-        raise FileNotFoundError(f"No s*_processed folders found in {corpus_root}")
+    samples = find_samples(corpus_root)
+    by_speaker = {}
+    for speaker_name, video_path, align_path in samples:
+        by_speaker.setdefault(speaker_name, []).append((video_path, align_path))
 
     total_videos = 0
     total_cached = 0
 
-    for speaker_dir in speaker_dirs:
-        speaker_name = os.path.basename(speaker_dir)
-        align_dir = os.path.join(speaker_dir, 'align')
+    for speaker_name, items in by_speaker.items():
         cache_dir = os.path.join(cache_root, speaker_name)
         os.makedirs(cache_dir, exist_ok=True)
 
-        video_paths = sorted(glob.glob(os.path.join(speaker_dir, '*.mpg')))
+        video_paths = [v for v, _ in items]
+        align_for = {v: a for v, a in items}
         total_videos += len(video_paths)
 
         # Count already-cached
@@ -52,7 +52,7 @@ def preprocess_and_cache(corpus_root, cache_root):
                 total_cached += 1
                 continue
 
-            align_path = os.path.join(align_dir, f"{video_name}.align")
+            align_path = align_for[video_path]
 
             try:
                 mouth_frames, char_indices, frame_word_labels, word_timings = load_data(

@@ -7,8 +7,6 @@ from matplotlib import pyplot as plt
 import imageio
 import gdown
 
-torch.device('cuda' if torch.cuda.is_available() else 'cpu') 
-
 #build our data loading fonctions.
  
 def download_data(url: str, output_path: str) -> None:
