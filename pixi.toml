@@ -15,6 +15,11 @@ train-lipreader = { cmd = "python -m lipreader.lipreading.train", description = 
 tts-prep = { cmd = "python -m lipreader.tts.prep", description = "Extract mels + mouth frames for TTS" }
 tts-train = { cmd = "python -m lipreader.tts.train", description = "Train the video-style TTS" }
 tts-infer = { cmd = "python -m lipreader.tts.infer", description = "Synthesise a wav from text and/or video" }
+# Lip-to-speech v2 (video -> speech with flow matching + HiFi-GAN)
+download-vocoder = { cmd = "python -m lipreader.vocoder", description = "Download the pretrained HiFi-GAN (UNIVERSAL_V1)" }
+v2s-prep = { cmd = "python -m lipreader.v2s.data", description = "Extract HiFi-GAN log-mels + normalisation stats into data/mels/" }
+v2s-train = { cmd = "python -m lipreader.v2s.train", description = "Train the lip-to-speech flow-matching model" }
+v2s-sample = { cmd = "python -m lipreader.v2s.sample", description = "Generate speech for validation clips or a --video" }
 
 [dependencies]
 python = "==3.10"

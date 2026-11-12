@@ -62,7 +62,10 @@ class LipReadingModel(nn.Module):
 
         self.dropout = nn.Dropout(0.3)
 
-    def forward(self, x):
+    OUT_DIM = 256  # size of the per-frame features returned by encode()
+
+    def encode(self, x):
+        """Mouth crops (B, T, H, W) → per-frame visual features (B, T, 256)."""
         B, T, H, W = x.size()
         x = x.unsqueeze(1)  # (B, 1, T, H, W)
 
@@ -72,8 +75,7 @@ class LipReadingModel(nn.Module):
         features = features.permute(0, 2, 1, 3, 4).reshape(B, T_out, -1)  # (B, T, 384)
 
         lstm_out, _ = self.bilstm(features)   # (B, T, 256)
-        lstm_out = self.dropout(lstm_out)
+        return self.dropout(lstm_out)
 
-        text_logits = self.text_head(lstm_out)      # (B, T, num_chars)
-
-        return text_logits
+    def forward(self, x):
+        return self.text_head(self.encode(x))      # (B, T, num_chars)

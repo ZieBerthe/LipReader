@@ -3,14 +3,16 @@
 Reconstructing the words and voice of a person talking in a silent video, on the
 [GRID corpus](https://zenodo.org/records/3625687).
 
-Two models exist today:
+Three models:
 
+- **Lip-to-speech v2** (video → speech, `lipreader/v2s/`): the lip reader's 3D-CNN + BiLSTM encodes
+  the mouth crops, a small Transformer trained with **conditional flow matching** generates the
+  log-mel spectrogram (32 Euler steps, classifier-free guidance), and a pretrained **HiFi-GAN**
+  turns it into audio. Background:
+  [docs/research/lip-to-speech-flow-matching.md](docs/research/lip-to-speech-flow-matching.md).
 - **Lip reader** (video → text): MediaPipe mouth crops → 3D-CNN + BiLSTM → CTC over characters.
 - **Video-style TTS** (text + video → speech): text encoder + mouth-video style embedding → mel
   spectrogram → Griffin-Lim.
-
-The planned next model generates speech directly from lip video with flow matching. See
-[docs/research/lip-to-speech-flow-matching.md](docs/research/lip-to-speech-flow-matching.md).
 
 ## Setup
 
@@ -26,6 +28,22 @@ Set `LIPREADER_DATA=/path/to/grid` to keep the data somewhere else. Both the dow
 (`s1/*.mpg` + `alignments/s1/*.align`) and the `s1_processed/{*.mpg,align/}` layout are recognised.
 
 ## Usage
+
+### Lip-to-speech v2
+
+```bash
+pixi run download-vocoder        # pretrained HiFi-GAN UNIVERSAL_V1 → checkpoints/hifigan/ (55 MB)
+pixi run v2s-prep                # HiFi-GAN log-mels + normalisation stats → data/mels/ (~1 min for s1)
+pixi run v2s-sample --copy-synthesis   # sanity check: ground-truth mels through HiFi-GAN
+pixi run v2s-train               # → checkpoints/v2s/{best,last}.pth, audio samples in outputs/v2s/
+pixi run v2s-sample              # generate validation clips (or --video data/s1/bbaf2n.mpg)
+```
+
+Useful `v2s-train` flags: `--init-encoder` (start from `checkpoints/lipreading_best.pth`),
+`--resume checkpoints/v2s/last.pth`, `--max-clips 4` (overfitting check), `--sample-every N`,
+`--steps` / `--cfg` for sampling. Split: 90/10 of the clips, fixed seed.
+
+### Other models
 
 | Command | What it does |
 |---|---|
@@ -44,7 +62,8 @@ reader uses batch size 4 (8 already swaps); on CUDA it uses 16.
 lipreader/
   paths.py            where data, checkpoints, logs and outputs live
   device.py           MPS / CUDA / CPU selection
-  audio.py            mel-spectrogram config, extraction and Griffin-Lim inversion
+  audio.py            HiFi-GAN-compatible log-mel extraction, Griffin-Lim inversion
+  vocoder.py          pretrained HiFi-GAN (download, load, mel → wav)
   utils.py            small helpers (stderr silencing for MediaPipe)
   data/
     download.py       fetch GRID s1
@@ -53,8 +72,13 @@ lipreader/
     vocab.py          character vocabulary (index 0 = CTC blank / padding)
     dataset.py        LipReadingDataset + collate_fn
     cache.py          precompute mouth crops to data/cache/
+  v2s/
+    data.py           mel prep, train/val split, dataset (mouth crops + mel)
+    model.py          FlowDecoder (Transformer) + LipToSpeech (encoder, flow loss, Euler sampler)
+    train.py          training loop
+    sample.py         generation + copy-synthesis
   lipreading/
-    model.py          3D-CNN + BiLSTM CTC network
+    model.py          3D-CNN + BiLSTM CTC network (encode() is reused by v2s)
     decoding.py       greedy CTC decoding, word accuracy
     train.py          training loop
   tts/
