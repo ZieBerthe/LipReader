@@ -1,17 +1,21 @@
-#all the data, you can just use download_data to download them
-data/
+# Data — re-create with `pixi run download` and `pixi run cache`
+/data/
 *.zip
 *.align
 *.mpg
-# pixi environments
-.pixi/*
-!.pixi/config.toml
-# pixi environments
-.pixi/*
+
+# Training outputs
+/checkpoints/
+/logs/
+/outputs/
 *.pth
 *.pt
-!.pixi/config.toml
 *.wav
-prepped/
+
+# Python
 __pycache__/
-logs/
+*.pyc
+
+# pixi environments
+.pixi/*
+!.pixi/config.toml

@@ -1,23 +1,26 @@
+"""PyTorch dataset over GRID clips (cached mouth crops + transcripts) and its collate fn."""
 import os
-import glob
-import torch
+import random
+
 import numpy as np
-from torch.utils.data import Dataset, DataLoader, random_split
-from matplotlib import pyplot as plt
-import imageio
-from load_data import load_data, decode_indices, encode_chars, char_to_num, num_to_char
-from paths import DATA_ROOT, CACHE_ROOT, find_samples
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+from lipreader.paths import DATA_ROOT, CACHE_ROOT, OUTPUT_DIR
+from lipreader.data.grid import find_samples, load_sample
+from lipreader.data.vocab import decode_indices
+
+# Global maximum dimensions for padding
+MAX_MOUTH_FRAMES = 75   # Maximum number of video frames
+MAX_TEXT_LENGTH = 50    # Maximum text sequence length (longest in GRID is 42)
+MAX_WORDS = 10          # Maximum number of words per sentence (GRID has 6)
 
 
-GRID_CORPUS_ROOT = DATA_ROOT
-
-
-# Custom Dataset for LipReading (text + word timing prediction)
 class LipReadingDataset(Dataset):
-    def __init__(self, corpus_root=GRID_CORPUS_ROOT, cache_root=None, use_cache=True):
+    def __init__(self, corpus_root=DATA_ROOT, cache_root=None, use_cache=True):
         """
         Args:
-            corpus_root: GRID root with speaker folders (see paths.find_samples for layouts).
+            corpus_root: GRID root with speaker folders (see grid.find_samples for layouts).
             cache_root:  Root directory for cached preprocessed data.
                          Defaults to paths.CACHE_ROOT (<data>/cache)
             use_cache:   Whether to use cached data (much faster!)
@@ -45,7 +48,7 @@ class LipReadingDataset(Dataset):
             cached_count = sum(1 for p in self.cache_paths if os.path.exists(p))
             if cached_count < len(self.video_paths):
                 print(f"⚠ Warning: Only {cached_count}/{len(self.video_paths)} videos cached.")
-                print(f"  Run 'python preprocess_cache.py' to cache all videos for faster loading.")
+                print(f"  Run `pixi run cache` to cache all videos for faster loading.")
             else:
                 print(f"✓ All {cached_count} videos cached.")
 
@@ -72,12 +75,11 @@ class LipReadingDataset(Dataset):
         # Fallback to on-the-fly processing — skip bad videos gracefully
         align_path = self.align_paths[idx]
         try:
-            mouth_frames, char_indices, frame_word_labels, word_timings = load_data(
+            mouth_frames, char_indices, frame_word_labels, word_timings = load_sample(
                 video_path, align_path
             )
         except Exception:
-            # Video is broken (no face detected, etc.) — return a random cached sample
-            import random
+            # Video is broken (no face detected, etc.) — return a random sample instead
             alt_idx = random.randint(0, len(self.video_paths) - 1)
             return self.__getitem__(alt_idx)
         return {
@@ -87,12 +89,6 @@ class LipReadingDataset(Dataset):
             'word_timings': word_timings,                                       # list of (word, start, end)
             'video_path': video_path,
         }
-
-
-# Global maximum dimensions for padding
-MAX_MOUTH_FRAMES = 75   # Maximum number of video frames
-MAX_TEXT_LENGTH = 50     # Maximum text sequence length (longest in GRID is 42)
-MAX_WORDS = 10           # Maximum number of words per sentence (GRID has 6)
 
 
 def collate_fn(batch):
@@ -139,44 +135,24 @@ def collate_fn(batch):
 
 
 if __name__ == "__main__":
-    dataset = LipReadingDataset(corpus_root=GRID_CORPUS_ROOT)
-    total_len = len(dataset)
-    train_len = int(0.7 * total_len)
-    test_len = total_len - train_len
-    train_set, test_set = random_split(
-        dataset, [train_len, test_len],
-        generator=torch.Generator().manual_seed(42)
-    )
-    batch_size = 10
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    import imageio
 
-    batch = next(iter(train_loader))
-    frames = batch['mouth_frames'].numpy()
-    alignments = batch['char_indices'].numpy()
+    dataset = LipReadingDataset()
+    loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
+    batch = next(iter(loader))
 
-    print('Batch mouth frames shape:', frames.shape)
-    print('Batch alignments shape:', alignments.shape)
-    print('Batch frame word labels shape:', batch['frame_word_labels'].shape)
-    print('Batch video paths:', batch['video_paths'])
-
-    first_video_frames = frames[0]
-    print('First video shape:', first_video_frames.shape)
-
-    # Save GIF of first video
-    gif_path = './animation.gif'
-    gif_frames = [((f - f.min()) / (f.max() - f.min()) * 255).astype(np.uint8)
-                  for f in first_video_frames]
-    imageio.mimsave(gif_path, gif_frames, fps=10)
-    print(f'Saved GIF to {gif_path}')
-
-    # Print text and word timings for each sample in the batch
-    for i in range(min(batch_size, len(batch['video_paths']))):
-        char_indices = batch['char_indices'][i].numpy()
-        text = ''.join([num_to_char[idx] for idx in char_indices if idx != 0])
-        print(f'\nVideo: {batch["video_paths"][i]}')
-        print(f'  Text: {text}')
-        print(f'  Frame labels (first 20): {batch["frame_word_labels"][i][:20].tolist()}')
-        print(f'  Word timings:')
+    print('Batch mouth frames shape:', tuple(batch['mouth_frames'].shape))
+    print('Batch char indices shape:', tuple(batch['char_indices'].shape))
+    for i, path in enumerate(batch['video_paths']):
+        text = decode_indices(batch['char_indices'][i].tolist())
+        print(f'\n{path}\n  Text: {text!r}')
         for word, start, end in batch['word_timings'][i]:
             print(f'    {word}: {start:.3f}s - {end:.3f}s')
+
+    # Save a GIF of the first clip's mouth crops to check the cropping visually
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    gif_path = os.path.join(OUTPUT_DIR, 'mouth_preview.gif')
+    frames = batch['mouth_frames'][0].numpy()
+    frames = ((frames - frames.min()) / (frames.max() - frames.min()) * 255).astype(np.uint8)
+    imageio.mimsave(gif_path, list(frames), fps=10)
+    print(f'\nSaved mouth-crop preview to {gif_path}')

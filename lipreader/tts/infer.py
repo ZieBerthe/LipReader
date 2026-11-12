@@ -8,46 +8,27 @@ Modes:
 The mel spectrogram is inverted to audio with Griffin-Lim (no separate
 vocoder training needed).
 
-Usage (from project root):
-    python tts/infer.py --text "bin blue at f two now" --video data/s1/bbaf2n.mpg
-    python tts/infer.py --text "bin blue at f two now" --frames tts/prepped/bbaf2n/frames.npy
-    python tts/infer.py --video data/s1/bbaf2n.mpg      # auto lip-read for text
+Usage:
+    pixi run tts-infer --text "bin blue at f two now" --video data/s1/bbaf2n.mpg
+    pixi run tts-infer --text "bin blue at f two now" --frames data/tts_prepped/s1/bbaf2n/frames.npy
+    pixi run tts-infer --video data/s1/bbaf2n.mpg      # auto lip-read for text
 """
 
 import os
 import sys
-import json
 import argparse
-import contextlib
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
 
 import numpy as np
 import torch
-import librosa
 import soundfile as sf
 
-from device import get_device
-from paths import LIPREADING_CKPT
-from load_data import (
-    load_video, char_to_num, num_to_char, vocab,
-    encode_chars, VIDEO_FPS,
-)
-from tts.train_tts_video_style import VideoStyleTTS, VOCAB_SIZE
-
-
-@contextlib.contextmanager
-def suppress_stderr():
-    fd = sys.stderr.fileno()
-    old = os.dup(fd)
-    with open(os.devnull, "w") as devnull:
-        os.dup2(devnull.fileno(), fd)
-        try:
-            yield
-        finally:
-            os.dup2(old, fd)
-            os.close(old)
+from lipreader.audio import mel_to_wav
+from lipreader.device import get_device
+from lipreader.paths import LIPREADING_CKPT, TTS_CKPT_DIR, OUTPUT_DIR
+from lipreader.utils import suppress_stderr
+from lipreader.data.grid import VIDEO_FPS
+from lipreader.data.vocab import NUM_CLASSES, encode_chars, num_to_char
+from lipreader.tts.model import VideoStyleTTS
 
 
 # ---------------------------------------------------------------------------
@@ -59,11 +40,11 @@ def lip_read_text(video_frames: torch.Tensor, device: torch.device) -> str:
 
     Falls back to a placeholder if the lip-reading checkpoint is missing.
     """
-    from model import LipReadingModel, ctc_greedy_decode, ids_to_text
-    from data_pipeline import MAX_MOUTH_FRAMES
+    from lipreader.data.dataset import MAX_MOUTH_FRAMES
+    from lipreader.lipreading.model import LipReadingModel
+    from lipreader.lipreading.decoding import ctc_greedy_decode, ids_to_text
 
-    num_chars = len(char_to_num) + 1  # +1 for CTC blank (index 0)
-    lr_model = LipReadingModel(num_chars=num_chars).to(device)
+    lr_model = LipReadingModel(num_chars=NUM_CLASSES).to(device)
 
     ckpt_path = LIPREADING_CKPT
     if not os.path.exists(ckpt_path):
@@ -93,35 +74,6 @@ def lip_read_text(video_frames: torch.Tensor, device: torch.device) -> str:
 
 
 # ---------------------------------------------------------------------------
-#  Mel → waveform (Griffin-Lim)
-# ---------------------------------------------------------------------------
-
-def mel_to_wav(log_mel: np.ndarray, mel_cfg: dict, n_iter: int = 60) -> np.ndarray:
-    """Invert a log-mel spectrogram to a waveform using Griffin-Lim.
-
-    Args:
-        log_mel:  (T_mel, n_mels) – model output (log scale)
-        mel_cfg:  dict with sr, n_fft, hop_length, win_length, fmin, fmax
-        n_iter:   Griffin-Lim iterations
-    Returns:
-        1-D float32 waveform
-    """
-    mel_linear = np.exp(log_mel).T                         # (n_mels, T_mel)
-
-    wav = librosa.feature.inverse.mel_to_audio(
-        mel_linear,
-        sr=mel_cfg["sr"],
-        n_fft=mel_cfg["n_fft"],
-        hop_length=mel_cfg["hop_length"],
-        win_length=mel_cfg["win_length"],
-        fmin=mel_cfg["fmin"],
-        fmax=mel_cfg["fmax"],
-        n_iter=n_iter,
-    )
-    return wav.astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
 
@@ -130,14 +82,16 @@ def main():
     parser.add_argument("--text",    default=None, help="Text to synthesise (if omitted, lip-reader is used)")
     parser.add_argument("--video",   default=None, help="Path to .mpg video (extracts frames on the fly)")
     parser.add_argument("--frames",  default=None, help="Path to pre-extracted frames .npy")
-    parser.add_argument("--ckpt",    default=os.path.join(ROOT, "tts", "checkpoints", "tts_best.pth"),
+    parser.add_argument("--ckpt",    default=os.path.join(TTS_CKPT_DIR, "tts_best.pth"),
                         help="TTS model checkpoint")
     parser.add_argument("--gl_iter", type=int, default=60, help="Griffin-Lim iterations")
+    parser.add_argument("--out",     default=None,
+                        help="Output wav path (default: outputs/tts_<video name>.wav)")
     args = parser.parse_args()
-    video_name = os.path.splitext(os.path.basename(args.video))[0] if args.video else "output"
-    parser.add_argument("--out",     default=os.path.join(ROOT, "tts", f"output{video_name}.wav"),
-                        help="Output wav path")
-    args = parser.parse_args()
+    if args.out is None:
+        name = args.video or args.frames
+        name = os.path.splitext(os.path.basename(name))[0] if name else "output"
+        args.out = os.path.join(OUTPUT_DIR, f"tts_{name}.wav")
 
     if args.video is None and args.frames is None:
         parser.error("Provide at least one of --video or --frames")
@@ -148,7 +102,7 @@ def main():
     # ---- Load checkpoint & mel config ----
     if not os.path.isfile(args.ckpt):
         print(f"Checkpoint not found: {args.ckpt}")
-        print("Train the TTS model first:  python tts/train_tts_video_style.py")
+        print("Train the TTS model first:  pixi run tts-train")
         sys.exit(1)
 
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
@@ -169,6 +123,7 @@ def main():
         print(f"Loaded pre-extracted frames: {frames.shape}")
     else:
         print("Extracting mouth frames from video …")
+        from lipreader.data.video import load_video  # lazy: imports MediaPipe
         with suppress_stderr():
             frames = load_video(args.video)                 # (T, H, W)
         print(f"Extracted {frames.shape[0]} frames.")

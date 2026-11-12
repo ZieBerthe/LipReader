@@ -1,17 +1,14 @@
-#!/usr/bin/env python3
-"""
-Preprocess all videos and cache extracted mouth frames to disk.
-Run this ONCE before training to speed up data loading.
+"""Preprocess all videos once and cache mouth crops + alignment data to disk (.pt per clip).
+
+Training reads from this cache, which is much faster than running MediaPipe every epoch.
 """
 import os
-import glob
-import torch
-import numpy as np
-from tqdm import tqdm
-from load_data import load_data
-from paths import DATA_ROOT, CACHE_ROOT, find_samples
 
-GRID_CORPUS_ROOT = DATA_ROOT
+import torch
+from tqdm import tqdm
+
+from lipreader.paths import DATA_ROOT, CACHE_ROOT
+from lipreader.data.grid import find_samples, load_sample
 
 
 def preprocess_and_cache(corpus_root, cache_root):
@@ -55,7 +52,7 @@ def preprocess_and_cache(corpus_root, cache_root):
             align_path = align_for[video_path]
 
             try:
-                mouth_frames, char_indices, frame_word_labels, word_timings = load_data(
+                mouth_frames, char_indices, frame_word_labels, word_timings = load_sample(
                     video_path, align_path
                 )
                 torch.save({
@@ -81,4 +78,4 @@ def preprocess_and_cache(corpus_root, cache_root):
 
 
 if __name__ == "__main__":
-    preprocess_and_cache(GRID_CORPUS_ROOT, CACHE_ROOT)
+    preprocess_and_cache(DATA_ROOT, CACHE_ROOT)

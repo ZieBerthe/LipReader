@@ -13,80 +13,24 @@ Outputs:
             mel.npy             (T_mel, n_mels) float32
             frames.npy          (T_video, H, W) float32  (normalised mouth crops)
 
-Usage (from project root):
-    python tts/prep.py
-    python tts/prep.py --max_samples 100   # quick test with fewer files
-    python tts/prep.py --workers 8         # parallel processing (default: auto)
+Usage:
+    pixi run tts-prep
+    pixi run tts-prep --max_samples 100   # quick test with fewer files
+    pixi run tts-prep --workers 8         # parallel processing (default: auto)
 """
 
 import os
-import sys
 import json
-import glob
 import argparse
-import contextlib
 import multiprocessing as mp
-from functools import partial
-
-# ── path setup so we can import from the project root ──
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
 
 import numpy as np
 from tqdm import tqdm
 
-# ── Mel spectrogram configuration ─────────────────────────────────────────
-MEL_SR        = 22050
-MEL_N_FFT     = 1024
-MEL_HOP       = 256
-MEL_WIN       = 1024
-MEL_N_MELS    = 80
-MEL_FMIN      = 0
-MEL_FMAX      = 8000
-
-
-@contextlib.contextmanager
-def suppress_stderr():
-    """Redirect stderr to devnull (silences C++ / MediaPipe warnings)."""
-    fd = sys.stderr.fileno()
-    old = os.dup(fd)
-    with open(os.devnull, "w") as devnull:
-        os.dup2(devnull.fileno(), fd)
-        try:
-            yield
-        finally:
-            os.dup2(old, fd)
-            os.close(old)
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────
-
-def extract_mel(video_path: str) -> np.ndarray:
-    """Extract log-mel spectrogram from the audio track of a video.
-
-    Returns:
-        (T_mel, n_mels) float32 array
-    """
-    import librosa  # import inside function for multiprocessing pickling
-    y, _ = librosa.load(video_path, sr=MEL_SR)
-    mel = librosa.feature.melspectrogram(
-        y=y, sr=MEL_SR,
-        n_fft=MEL_N_FFT, hop_length=MEL_HOP, win_length=MEL_WIN,
-        n_mels=MEL_N_MELS, fmin=MEL_FMIN, fmax=MEL_FMAX,
-    )
-    log_mel = np.log(np.maximum(mel, 1e-5))        # log-mel
-    return log_mel.astype(np.float32).T             # (T_mel, n_mels)
-
-
-def extract_text(alignment_path: str) -> str:
-    """Return the spoken sentence from a GRID .align file (no 'sil')."""
-    words = []
-    with open(alignment_path) as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) >= 3 and parts[2] != "sil":
-                words.append(parts[2])
-    return " ".join(words)
+from lipreader.audio import MEL_CONFIG, extract_mel
+from lipreader.data.grid import find_samples, read_transcript
+from lipreader.paths import DATA_ROOT, TTS_PREP_ROOT
+from lipreader.utils import suppress_stderr
 
 
 # ── Worker function for multiprocessing ────────────────────────────────────
@@ -112,7 +56,7 @@ def _process_one(args_tuple):
         try:
             mel = np.load(mel_path)
             frames = np.load(frames_path)
-            text = extract_text(align_path)
+            text = read_transcript(align_path)
             return dict(
                 id=vid_id,
                 speaker=speaker_name,
@@ -136,7 +80,7 @@ def _process_one(args_tuple):
 
     # ---- mouth crop frames ----
     try:
-        from load_data import load_video  # import per-worker for MediaPipe
+        from lipreader.data.video import load_video  # import per-worker for MediaPipe
         with suppress_stderr():
             frames_tensor = load_video(video_path)      # (T, H, W) normalised
         frames_np = frames_tensor.numpy().astype(np.float32)
@@ -145,7 +89,7 @@ def _process_one(args_tuple):
     np.save(frames_path, frames_np)
 
     # ---- text ----
-    text = extract_text(align_path)
+    text = read_transcript(align_path)
 
     return dict(
         id=vid_id,
@@ -160,16 +104,12 @@ def _process_one(args_tuple):
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
-from paths import DATA_ROOT, TTS_PREP_ROOT, find_samples
-
-GRID_CORPUS_ROOT = DATA_ROOT
-DEFAULT_OUTPUT   = TTS_PREP_ROOT
 
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess GRID data for TTS")
-    parser.add_argument("--corpus_root", default=GRID_CORPUS_ROOT)
-    parser.add_argument("--output_dir",  default=DEFAULT_OUTPUT)
+    parser.add_argument("--corpus_root", default=DATA_ROOT)
+    parser.add_argument("--output_dir",  default=TTS_PREP_ROOT)
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Limit number of samples (for quick testing)")
     parser.add_argument("--workers", type=int, default=None,
@@ -199,10 +139,7 @@ def main():
     print(f"  Already cached: {cached_count}  |  To process: {len(work_items) - cached_count}")
 
     # ---- Save mel config so train / infer scripts stay consistent ----
-    mel_config = dict(
-        sr=MEL_SR, n_fft=MEL_N_FFT, hop_length=MEL_HOP,
-        win_length=MEL_WIN, n_mels=MEL_N_MELS, fmin=MEL_FMIN, fmax=MEL_FMAX,
-    )
+    mel_config = MEL_CONFIG
     config_path = os.path.join(args.output_dir, "tts_mel_config.json")
     with open(config_path, "w") as f:
         json.dump(mel_config, f, indent=2)

@@ -5,6 +5,16 @@ platforms = ["linux-64", "osx-arm64"]
 version = "0.1.0"
 
 [tasks]
+# Data
+download = { cmd = "python -m lipreader.data.download", description = "Download GRID speaker s1 into data/" }
+cache = { cmd = "python -m lipreader.data.cache", description = "Extract and cache mouth crops for every clip" }
+preview = { cmd = "python -m lipreader.data.dataset", description = "Print a batch and save a mouth-crop GIF to outputs/" }
+# Lip reading (video -> text)
+train-lipreader = { cmd = "python -m lipreader.lipreading.train", description = "Train the CTC lip reader" }
+# Video-style TTS (text + video -> speech)
+tts-prep = { cmd = "python -m lipreader.tts.prep", description = "Extract mels + mouth frames for TTS" }
+tts-train = { cmd = "python -m lipreader.tts.train", description = "Train the video-style TTS" }
+tts-infer = { cmd = "python -m lipreader.tts.infer", description = "Synthesise a wav from text and/or video" }
 
 [dependencies]
 python = "==3.10"
@@ -12,6 +22,7 @@ pip = "*"
 gdown = ">=5.2.1,<6"
 tqdm = ">=4.67.3,<5"
 setuptools = ">=82.0.1,<83"
+ffmpeg = "*"  # librosa reads the audio track of the .mpg files through ffmpeg
 
 [pypi-dependencies]
 torch = ">=2.5.0"
